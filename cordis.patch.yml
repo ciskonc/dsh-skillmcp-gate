@@ -1,0 +1,7 @@
+# skillmcp-gate bundle patch
+#
+# `dsh.bundle.patch` layer: `dsh plugin add` appends this insert row to the
+# bundle stack (same as a manual cordis.patch.yml mount line).
+- insert:
+    - id: skillmcp-gate
+      name: '@dsh-external/skillmcp-gate'
