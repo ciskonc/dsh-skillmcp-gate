@@ -1,5 +1,5 @@
 /**
- * @dsh-external/skillmcp-gate — host 侧（skillmcp-gate M3）。
+ * dsh-skillmcp-gate — host 侧（skillmcp-gate M3）。
  * 按会话管控 skill / MCP 工具暴露集：
  *  - 工具：agent.ctx.tools.restrict({deny})（官方 scoped seam，下一条消息生效）
  *  - 技能：agent.ctx.skills.register(stub)（同名就近覆盖，目录描述变为"已禁用"）
@@ -51,7 +51,7 @@ const API_PREFIX = '/skillmcp-gate/api'
 const MCP_RE = /^mcp__([A-Za-z0-9_-]+)__(.+)$/
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---/
 
-export const name = '@dsh-external/skillmcp-gate'
+export const name = 'dsh-skillmcp-gate'
 export const inject = ['tools', 'skills', 'agents', 'webServer', 'workingDirectory']
 
 export interface Config {

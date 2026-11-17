@@ -1,5 +1,5 @@
 /**
- * @dsh-external/skillmcp-gate — client 侧（0.4.2）。
+ * dsh-skillmcp-gate — client 侧（0.4.2）。
  * 0.4.2 变更：
  *  - 命名统一「Skill & MCP」；正文术语 skill 保留英文不译中文
  *  - 修复右侧栏 tab：title slot 补 React 组件（照官方 FilesTitle 形状，useTabInfo 取 tab.title）；
@@ -38,7 +38,7 @@ type ClientContext = Context & {
 
 export const inject = ['slots', 'sidebarRight', 'sidebarRightTabs']
 
-const PKG = '@dsh-external/skillmcp-gate'
+const PKG = 'dsh-skillmcp-gate'
 const API = '/skillmcp-gate/api'
 const TITLE = 'Skill & MCP'
 /** banner 入口显示开关的 localStorage 键（默认关：右侧栏为默认入口） */

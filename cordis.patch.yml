@@ -4,4 +4,4 @@
 # bundle stack (same as a manual cordis.patch.yml mount line).
 - insert:
     - id: skillmcp-gate
-      name: '@dsh-external/skillmcp-gate'
+      name: 'dsh-skillmcp-gate'
