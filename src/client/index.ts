@@ -79,13 +79,42 @@ async function apiGet(query: string): Promise<State> {
   return res.json()
 }
 
-async function apiSet(body: any): Promise<void> {
+async function apiSet(body: any): Promise<{ ok?: boolean; partial?: boolean; applied?: any; error?: string }> {
   const res = await apiFetch(`${API}/set`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`set ${res.status}`)
+  const data = await res.json().catch(() => ({}) as any)
+  if (!res.ok) throw new Error(`set ${res.status}${data?.error ? `: ${data.error}` : ''}`)
+  return data
+}
+
+// ── 草稿持久化（0.5.5 修复 M6：整页刷新不再丢草稿）────────────────
+// sessionStorage = tab 作用域：刷新/前进后退保留，关 tab 即弃——符合草稿的临时意图语义。
+
+function draftStorageKey(sessionId: string | undefined, globalMode: boolean): string {
+  return `skillmcp-gate:draft:${globalMode ? 'global' : (sessionId || 'nosession')}`
+}
+
+function loadDraft(key: string): { t: Set<string>; s: Set<string> } | null {
+  try {
+    const raw = window.sessionStorage.getItem(key)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as { t?: unknown; s?: unknown }
+    if (!parsed || typeof parsed !== 'object') return null
+    return {
+      t: new Set(Array.isArray(parsed.t) ? parsed.t.filter((x): x is string => typeof x === 'string') : []),
+      s: new Set(Array.isArray(parsed.s) ? parsed.s.filter((x): x is string => typeof x === 'string') : []),
+    }
+  } catch { return null }
+}
+
+function saveDraft(key: string, draft: { t: Set<string>; s: Set<string> } | null): void {
+  try {
+    if (draft) window.sessionStorage.setItem(key, JSON.stringify({ t: [...draft.t], s: [...draft.s] }))
+    else window.sessionStorage.removeItem(key)
+  } catch { /* 存储不可用（隐私模式）时草稿仅内存态 */ }
 }
 
 function bannerEnabled(): boolean {
@@ -106,8 +135,37 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
   const [st, setSt] = useState<State | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [applying, setApplying] = useState(false)
-  /** 草稿：勾选只改本地，点"应用"才批量提交（减少缓存失效次数） */
-  const [draft, setDraft] = useState<{ t: Set<string>; s: Set<string> } | null>(null)
+  const [appliedMsg, setAppliedMsg] = useState<string | null>(null)
+  // 0.5.5（r2a 建议 #8）：列表搜索过滤
+  const [filter, setFilter] = useState('')
+  const appliedTimerRef = useRef<number | null>(null)
+  const flashAppliedMsg = (msg: string): void => {
+    setAppliedMsg(msg)
+    if (appliedTimerRef.current !== null) window.clearTimeout(appliedTimerRef.current)
+    appliedTimerRef.current = window.setTimeout(() => setAppliedMsg(null), 3000)
+  }
+  /** 草稿：勾选只改本地，点"应用"才批量提交（减少缓存失效次数）；sessionStorage 持久化（0.5.5 修复 M6） */
+  const draftKey = draftStorageKey(sessionId, globalMode)
+  const [draft, setDraft] = useState<{ t: Set<string>; s: Set<string> } | null>(() => loadDraft(draftKey))
+  useEffect(() => {
+    saveDraft(draftKey, draft)
+    // 0.5.5（r2a 建议 #5）：同 tab 多实例（侧栏 + banner）共享同一把 session 草稿键——
+    // 自定义事件同步（sessionStorage 无 storage 事件）；值相同时不回设，避免环
+    try { window.dispatchEvent(new CustomEvent('skillmcp-gate:draft-changed', { detail: { key: draftKey } })) } catch { /* ignore */ }
+  }, [draftKey, draft])
+  useEffect(() => {
+    const handler = (e: any): void => {
+      if (e?.detail?.key !== draftKey) return
+      const next = loadDraft(draftKey)
+      setDraft((cur) => {
+        const same = (cur === null && next === null)
+          || (cur !== null && next !== null && setEquals(cur.t, next.t) && setEquals(cur.s, next.s))
+        return same ? cur : next
+      })
+    }
+    window.addEventListener('skillmcp-gate:draft-changed', handler as EventListener)
+    return () => window.removeEventListener('skillmcp-gate:draft-changed', handler as EventListener)
+  }, [draftKey])
   const reloadRef = useRef<() => void>(() => {})
 
   const load = useCallback(async (): Promise<void> => {
@@ -124,11 +182,14 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
     }
   }, [sessionId])
 
+  const prevSidRef = useRef<string | undefined>(undefined)
   useEffect(() => {
-    // sessionId 变化（切换会话）时草稿跨会话无意义——清空再加载
-    setDraft(null)
+    // 切换会话时草稿跨会话无意义——清空（挂载时不清：刚从 sessionStorage 恢复的草稿要保留）
+    const prev = prevSidRef.current
+    prevSidRef.current = sessionId
+    if (prev !== undefined && prev !== sessionId) setDraft(null)
     void load()
-  }, [load])
+  }, [load, sessionId])
   reloadRef.current = () => { void load() }
 
   const applyDraft = useCallback(async (): Promise<void> => {
@@ -137,11 +198,21 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
     setApplying(true)
     try {
       setErr(null)
-      const body = globalMode
-        ? { scope: 'global', deniedTools: [...snapshot.t], deniedSkills: [...snapshot.s] }
-        : { scope: 'session', sessionId, deniedTools: [...snapshot.t], deniedSkills: [...snapshot.s] }
-      await apiSet(body)
+      let data: { ok?: boolean; partial?: boolean; applied?: any }
+      if (globalMode) {
+        data = await apiSet({ scope: 'global', deniedTools: [...snapshot.t], deniedSkills: [...snapshot.s] })
+      } else {
+        // 0.5.5 修复 B1/B3（r2 双确认的高危）：Skill=全局语义——会话写只带 tools，
+        // 并显式清空会话条目的历史 skills 污染副本（空 delta 即删键）；
+        // skill 改动走独立全局写（host 0.5.5：缺失字段=保持现值，不会误伤 global.deniedTools）
+        data = await apiSet({ scope: 'session', sessionId, deniedTools: [...snapshot.t], deniedSkills: [] })
+        const g = await apiSet({ scope: 'global', deniedSkills: [...snapshot.s] })
+        data = { ok: data.ok && g.ok, partial: data.partial === true || g.partial === true, applied: data.applied }
+      }
       await load()
+      // 0.5.5 修复 L3：应用结果显式反馈（消费 host 0.5.5 的真实聚合——partial 提示后台重试）
+      const isPartial = data?.partial === true || data?.applied?.result?.partial === true
+      flashAppliedMsg(isPartial ? '⚠ 已应用：部分工具暂未生效（将自动重试）' : '✓ 已应用')
       // 0.5.1：应用期间的新勾选不吞——仅当 draft 仍等于提交快照时清空，否则保留增量
       setDraft((prev) => {
         if (!prev) return null
@@ -155,8 +226,9 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
     }
   }, [draft, applying, globalMode, sessionId, load])
 
-  if (err !== null) {
-    // 0.5.1：错误页加重试入口（不再卡死到组件重挂）
+  if (err !== null && st === null) {
+    // 0.5.1：错误页加重试入口（不再卡死到组件重挂）。
+    // 0.5.5 修复 bug③：已有数据时（st 非 null）不再整块替换为错误页——降级为内联错误条。
     return h('div', { style: { padding: 10 } },
       h('div', { style: { color: '#f66', marginBottom: 8 } }, `加载失败：${err}`),
       h('button', {
@@ -203,21 +275,38 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
     }
     setDraft({ t: next, s: new Set(base.s) })
   }
+  // 0.5.5 修复 M7：Skill 组与 MCP server 组同款整组勾选（语义一致，恢复不再反向操作）
+  const setAllSkills = (denyAll: boolean): void => {
+    const base = draft ?? { t: new Set(appliedT), s: new Set(appliedS) }
+    const next = new Set(base.s)
+    for (const s of st.skills) {
+      if (denyAll) next.add(s.name)
+      else next.delete(s.name)
+    }
+    setDraft({ t: new Set(base.t), s: next })
+  }
 
-  const mcpRows = st.tools.filter((t) => t.kind === 'mcp')
-  const mcpTotal = mcpRows.length
-  // 0.5.1 修复：可用数对真实清单过滤计数（幽灵条目不再拉低、不再出现负数）
-  const mcpAvailable = mcpRows.filter((t) => !deniedT.has(t.name)).length
+  // 0.5.5（r2b 建议 #8）：列表搜索过滤（仅过滤行显示；计数仍为全量口径）
+  const fq = filter.trim().toLowerCase()
+  const rowMatch = (name: string, desc?: string): boolean =>
+    fq === '' || name.toLowerCase().includes(fq) || (desc ?? '').toLowerCase().includes(fq)
+
+  const mcpRows = st.tools.filter((t) => t.kind === 'mcp' && rowMatch(t.name, t.description))
+  // 0.5.5 修复（rv-ui P1）：状态行计数恒为全量口径（搜索只过滤行显示，不缩水分母/分子）
+  const mcpTotal = st.tools.filter((t) => t.kind === 'mcp').length
+  const mcpAvailable = st.tools.filter((t) => t.kind === 'mcp' && !deniedT.has(t.name)).length
   const skillAvailable = st.skills.filter((s) => !deniedS.has(s.name)).length
   const rowStyle = { display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0', cursor: 'pointer' }
   const groupStyle = { margin: '8px 0', border: '1px solid rgba(127,127,127,.25)', borderRadius: 6, padding: '6px 8px' }
 
   const serverGroups = st.mcpServers.map((server: string) => {
     const serverTools = mcpRows.filter((t) => t.server === server)
-    const serverAvailable = serverTools.filter((t) => !deniedT.has(t.name)).length
-    const allDenied = serverAvailable === 0
+    if (fq !== '' && serverTools.length === 0) return null // 搜索时隐藏无匹配组
+    const serverAll = st.tools.filter((x) => x.kind === 'mcp' && x.server === server)
+    const serverAvailable = serverAll.filter((t) => !deniedT.has(t.name)).length
+    const allDenied = serverAvailable === 0 && serverAll.length > 0
     const toolRows = serverTools.map((t: ToolRow) =>
-      h('label', { key: t.name, style: rowStyle, title: t.description?.slice(0, 160) },
+      h('label', { key: t.name, style: rowStyle, title: `${t.name}${t.description ? ' — ' + t.description.slice(0, 140) : ''}` },
         h('input', {
           type: 'checkbox',
           checked: !deniedT.has(t.name),
@@ -238,14 +327,15 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
           checked: !allDenied,
           onChange: (e: any) => setServer(server, !e.target.checked),
         }),
-        h('span', null, `MCP · ${server}（${serverAvailable}/${serverTools.length} 可用）`),
+        // 0.5.5（r2b 建议 #3）：全禁状态醒目提示
+        h('span', null, `MCP · ${server}（${serverAvailable}/${serverAll.length} 可用）${allDenied ? ' ⚠ 全部禁用' : ''}`),
       ),
       h('div', { style: { margin: '2px 0 0 18px' } }, toolRows),
     )
   })
 
-  const skillRows = st.skills.map((sk: SkillRow) =>
-    h('label', { key: sk.name, style: rowStyle, title: sk.description?.slice(0, 160) },
+  const skillRows = st.skills.filter((sk: SkillRow) => rowMatch(sk.name, sk.description)).map((sk: SkillRow) =>
+    h('label', { key: sk.name, style: rowStyle, title: `${sk.name}${sk.description ? ' — ' + sk.description.slice(0, 140) : ''}` },
       h('input', {
         type: 'checkbox',
         checked: !deniedS.has(sk.name),
@@ -260,10 +350,13 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
     ),
   )
 
-  // 0.5.1 修复 M-4：状态行语义正确（「应用后」预览用目标集计算）
-  const scopeLabel = globalMode ? '全局默认' : '下条消息生效'
+  // 0.5.1 修复 M-4：状态行语义正确（「应用后」预览用目标集计算）。
+  // 0.5.5（r2 双报告建议 #1/高危文案矛盾）：按项分别标注作用域——MCP=本会话、Skill=全局，
+  // 草稿态不再把 Skill 误标成「本会话」。
   const statusLine = draft !== null
-    ? `应用后：${mcpAvailable}/${mcpTotal} MCP · ${skillAvailable}/${st.skills.length} Skill${globalMode ? '（全局默认）' : globalMode === false ? `（本会话${st.agentLive ? '' : ' · 下条消息唤醒时生效'}）` : ''}`
+    ? globalMode
+      ? `应用后（全局默认）：${mcpAvailable}/${mcpTotal} MCP · ${skillAvailable}/${st.skills.length} Skill（新会话继承）`
+      : `应用后：${mcpAvailable}/${mcpTotal} MCP（本会话）· ${skillAvailable}/${st.skills.length} Skill（全局）${st.agentLive ? '' : ' · 下条消息唤醒时生效'}`
     : globalMode
       ? `全局默认：${mcpAvailable}/${mcpTotal} MCP · ${skillAvailable}/${st.skills.length} Skill（新会话继承）`
       : `下条消息生效：${mcpAvailable}/${mcpTotal} MCP（本会话）· ${skillAvailable}/${st.skills.length} Skill（全局）${st.agentLive ? '' : ' · 下条消息唤醒时生效'}`
@@ -290,18 +383,79 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
       h('span', { style: { fontSize: 16 } }, '⚡'),
       h('span', null, TITLE),
     ),
-    h('div', { style: { fontSize: 11, opacity: 0.5, marginBottom: 6 } },
-      globalMode ? '全局默认（新会话继承）' : '本会话面板 · MCP 勾选只影响当前会话'),
+    h('div', { style: { fontSize: 11, opacity: 0.5, marginBottom: 4 } },
+      globalMode
+        ? '全局默认（新会话继承）· MCP=全局默认 · Skill=全局生效'
+        : `本会话面板${sessionId ? ` · 绑定 …${sessionId.slice(-6)}` : ''} · MCP 勾选只影响当前会话`),
+    // 0.5.5 修复 M7：常驻语义图例（勾选=可用，取消=禁用——恢复操作不再反向）
+    h('div', { style: { fontSize: 11, opacity: 0.65, marginBottom: 6 } },
+      '勾选 = 可用 · 取消勾选 = 禁用 · 改动需「批量应用」后生效'),
+    // 0.5.5（r2b bug③）：加载失败但已有数据时降级为内联错误条（不再整块替换面板）
+    err !== null && st !== null && h('div', {
+      style: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px', marginBottom: 8, borderRadius: 6, background: 'rgba(255,80,80,.12)', fontSize: 11 },
+    },
+      h('span', { style: { color: '#f66', flex: 1 } }, `刷新失败：${err}`),
+      h('button', {
+        onClick: () => void reloadRef.current(),
+        style: { padding: '2px 8px', borderRadius: 4, border: '1px solid rgba(127,127,127,.4)', cursor: 'pointer', background: 'transparent', color: 'inherit', fontSize: 11 },
+      }, '重试'),
+    ),
+    // 0.5.5（r2a bug B2 缓解）：空会话提示
+    !globalMode && !sessionId && h('div', {
+      style: { padding: '4px 8px', marginBottom: 8, borderRadius: 6, background: 'rgba(255,180,0,.15)', fontSize: 11 },
+    }, '⚠ 未绑定具体会话——请先在左侧选择或新建一个会话，再回到本面板操作'),
+    // 0.5.5（r2a 建议 #8）：搜索框
+    h('input', {
+      value: filter,
+      onChange: (e: any) => setFilter(String(e.target.value ?? '')),
+      placeholder: '搜索工具 / 技能…',
+      style: {
+        width: '100%', padding: '4px 8px', marginBottom: 8, borderRadius: 4,
+        border: '1px solid rgba(127,127,127,.35)', background: 'transparent', color: 'inherit', fontSize: 12,
+        boxSizing: 'border-box',
+      },
+    }),
     h('div', { style: { padding: '6px 8px', marginBottom: 8, borderRadius: 6, background: 'rgba(127,127,127,.15)' } },
       statusLine),
-    // 横条：仅在存在真实未应用变更时显示（0.5.1）
+    // 0.5.5 修复 L3：应用结果反馈条（3s 自动消失；partial 提示后台自动重试）
+    appliedMsg !== null && h('div', {
+      style: {
+        padding: '6px 8px', marginBottom: 8, borderRadius: 6, fontSize: 11,
+        background: appliedMsg.startsWith('⚠') ? 'rgba(255,180,0,.18)' : 'rgba(80,200,120,.15)',
+      },
+    }, appliedMsg),
+    ...serverGroups,
+    h('div', { style: groupStyle },
+      h('label', {
+        style: { ...rowStyle, fontWeight: 600 },
+        // 0.5.5（r2a bug B6 缓解）：目录口径说明
+        title: '勾选=整组可用；取消=整组禁用。清单为全局技能目录，各会话按预设加载，实际目录可能与此略有差异',
+      },
+        h('input', {
+          type: 'checkbox',
+          checked: skillAvailable > 0 || st.skills.length === 0,
+          onChange: (e: any) => setAllSkills(!e.target.checked),
+        }),
+        h('span', null, `Skill（${skillAvailable}/${st.skills.length} 可用）${skillAvailable === 0 && st.skills.length > 0 ? ' ⚠ 全部禁用' : ''}`),
+      ),
+      ...skillRows,
+      h('div', {
+        style: {
+          marginTop: 6, padding: '4px 6px', borderRadius: 4,
+          background: 'rgba(255,180,0,.15)', fontSize: 11,
+        },
+      }, '⚠ Skill 开关为全局生效：影响所有会话（暂不支持单会话级管控）'),
+    ),
+    // 横条吸底（0.5.5 r2a 建议 #4）：列表滚动到底也可见「批量应用」
     draft !== null && diffCount > 0 && h('div', {
       style: {
-        padding: '6px 8px', marginBottom: 8, borderRadius: 6,
-        background: 'rgba(255,180,0,.15)', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        position: 'sticky', bottom: 0, marginTop: 8,
+        padding: '6px 8px', borderRadius: 6,
+        background: 'rgba(255,180,0,.28)', backdropFilter: 'blur(3px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
       },
     },
-      h('span', null, `⚠ ${diffCount} 项变更待应用`),
+      h('span', { style: { fontWeight: 600 } }, `⚠ ${diffCount} 项变更待应用`),
       h('button', {
         onClick: () => void applyDraft(),
         disabled: applying,
@@ -310,18 +464,6 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
           background: applying ? 'rgba(74,158,255,.5)' : '#4a9eff', color: '#fff', fontSize: 11,
         },
       }, applying ? '应用中…' : '批量应用'),
-    ),
-    ...serverGroups,
-    h('div', { style: groupStyle },
-      h('div', { style: { fontWeight: 600, margin: '2px 0' } },
-        `Skill（${skillAvailable}/${st.skills.length} 可用）`),
-      ...skillRows,
-      h('div', {
-        style: {
-          marginTop: 6, padding: '4px 6px', borderRadius: 4,
-          background: 'rgba(255,180,0,.15)', fontSize: 11,
-        },
-      }, '⚠ Skill 开关为全局生效：影响所有会话（暂不支持单会话级管控）'),
     ),
     globalMode && h('div', { style: { margin: '8px 0' } },
       h('label', { style: rowStyle, title: '开启后会在会话顶部显示 Skill & MCP 入口；右侧栏始终可用' },

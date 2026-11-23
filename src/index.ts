@@ -1,12 +1,18 @@
 /**
- * dsh-skillmcp-gate — host 侧（0.5.1 对抗审查修复版）。
+ * dsh-skillmcp-gate — host 侧（0.5.5 实用性加固版）。
  * 按会话管控 skill / MCP 工具暴露集：
  *  - 工具：agent.ctx.tools.restrict({deny})（官方 scoped seam，下一条消息生效）
- *  - 技能：agent.ctx.skills.register(stub)（注意：0.2.2-rc.5 是 first-wins 非「覆盖」，
- *    且 project 来源 rank 低于 runtime 层——project 级 skill 的 stub 方案无效，
- *    生效通道是 skills.snapshot patch 过滤；stub 仅作 user/custom 来源的辅助层。迁移 SkillProvider 见 V2）
- *  - 持久化：~/.dsh/storages/skillmcp-gate.json（原子写 tmp+rename；读失败分级处理）
- *  - 重放：agents.get/list 包装懒执行 + 2s sweep（partial 永不短路，失败自动重试）
+ *  - 技能：skills.snapshot monkey-patch 过滤（唯一生效通道）。stub 辅助层已移除——
+ *    0.5.3 实测 agent-loop 的 agent ctx 未注入 skills，register 恒抛
+ *    "cannot get property skills without inject"，stub 100% 失败且喂养 partial 重试风暴；
+ *    SkillProvider 迁移见 V2。
+ *  - 持久化：~/.dsh/storages/skillmcp-gate.json（原子写 tmp+rename；读失败分级处理；
+ *    sessions 用 null 原型对象 + 保留键黑名单——0.5.5 修复原型键毒化）
+ *  - 重放：agents.get/list 包装懒执行 + 2s sweep（partial 永不短路；退避计数跨轮累计——
+ *    0.5.5 修复 detach 先删导致 failCount 恒 1 的死代码）
+ *  - API 信任门（0.5.5）：Origin/Referer 同源校验 + 拒绝跨站 sec-fetch-site +
+ *    写请求强制 application/json（堵浏览器 CSRF simple request 通道；
+ *    本机脚本直连按「与 store 文件同权限」模型放行，绑定非 loopback 不受支持）
  *
  * ── 命名三分法（不可改契约，改动前必读）────────────────────────
  *  - 包名 dsh-skillmcp-gate：可改（需同步 package.json/host name/client PKG/tsdown PLUGIN_ID/cordis.patch.yml 五处）
@@ -17,7 +23,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, statSync, appendFileSync, statSync as stat } from 'node:fs'
+import { readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, statSync, appendFileSync, unlinkSync, statSync as stat } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -62,8 +68,16 @@ const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---/
 /** normalizeSet 上限：防超长列表原样落盘并传宿主（0.5.1） */
 const DENY_MAX_ITEMS = 1000
 const DENY_MAX_NAME_LEN = 256
+/** sessionId 形态校验 + Object.prototype 保留键黑名单（0.5.5 修复原型键毒化 store） */
+const SID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+const SID_MAX_LEN = 64
+const PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype', 'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable', 'toLocaleString'])
+const isReservedKey = (key: string): boolean => PROTO_KEYS.has(key)
+const validSid = (sid: string): boolean => sid.length <= SID_MAX_LEN && SID_RE.test(sid) && !isReservedKey(sid)
 /** trace.log 轮转阈值 */
 const TRACE_MAX_BYTES = 512 * 1024
+/** old.log 保留上限：超过即删除（最多保留 2 代 ≈ 1MB，0.5.5 修复 old.log 无界增长） */
+const TRACE_OLD_MAX_BYTES = TRACE_MAX_BYTES * 2
 
 export const name = 'dsh-skillmcp-gate'
 // workingDirectory 不强制声明（0.5.1：可选服务缺失时避免 cordis park 整个插件；
@@ -82,22 +96,31 @@ export const Config = z.object({
 
 function normalizeSet(list: unknown): string[] {
   if (!Array.isArray(list)) return []
-  const cleaned = [...new Set(list.filter((v): v is string => typeof v === 'string' && v.length > 0 && v.length <= DENY_MAX_NAME_LEN))].sort()
+  // 0.5.5 修复 H5：trim 空白变体（大小写不折叠——工具名大小写敏感，折叠会错禁；
+  // 变体防「禁不掉」由 /set 入口的同源白名单过滤完成）
+  const cleaned = [...new Set((list as unknown[])
+    .filter((v): v is string => typeof v === 'string')
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0 && v.length <= DENY_MAX_NAME_LEN))].sort()
   return cleaned.slice(0, DENY_MAX_ITEMS)
 }
 
 function normalizeSessions(raw: Record<string, DenialSet>): Record<string, DenialSet> {
   // 键统一为裸 uuid（循环剥前缀防 session-session- 双前缀残留），元素过 normalizeSet 清洗
-  const out: Record<string, DenialSet> = {}
+  // 0.5.5 修复 H2：out 用 null 原型对象——`out['constructor']` 不再命中 Object.prototype；
+  // 保留键直接跳过；条目值非对象/数组形态畸形时剥为空而不是抛错（旧毒化 store 自愈，
+  // 不再整库判 corrupted 隔离）
+  const out: Record<string, DenialSet> = Object.create(null)
   for (const [k, v] of Object.entries(raw ?? {})) {
     let key = String(k)
     while (key.startsWith('session-')) key = key.slice('session-'.length)
-    if (!key) continue
+    if (!key || isReservedKey(key)) continue
+    const rec = (v && typeof v === 'object' && !Array.isArray(v) ? v : null) as Partial<DenialSet> | null
     // 0.5.2 修复 W5：空/非法条目不建幽灵键（sessionsIndex 不再显示 0/0 残留）
-    const tools = normalizeSet(v?.deniedTools)
-    const skills = normalizeSet(v?.deniedSkills)
+    const tools = normalizeSet(rec?.deniedTools)
+    const skills = normalizeSet(rec?.deniedSkills)
     if (tools.length === 0 && skills.length === 0) continue
-    const cur = out[key] ?? { deniedTools: [], deniedSkills: [] }
+    const cur = Object.prototype.hasOwnProperty.call(out, key) ? out[key] : { deniedTools: [], deniedSkills: [] }
     out[key] = {
       deniedTools: [...new Set([...cur.deniedTools, ...tools])].sort(),
       deniedSkills: [...new Set([...cur.deniedSkills, ...skills])].sort(),
@@ -113,7 +136,14 @@ function normalizeStore(raw: Partial<Store>): Store {
   }
 }
 
-const EMPTY_STORE: Store = { global: { deniedTools: [], deniedSkills: [] }, sessions: {} }
+/** 原地过滤：只保留 known 集合中的名字（0.5.5 /set 入口同源白名单共用） */
+function patchFilter(list: string[], known: Set<string>): void {
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    if (!known.has(list[i])) list.splice(i, 1)
+  }
+}
+
+const EMPTY_STORE: Store = { global: { deniedTools: [], deniedSkills: [] }, sessions: Object.create(null) }
 
 /**
  * 读 store。返回 corrupted=true 表示「文件存在但损坏/不可读」——
@@ -205,13 +235,22 @@ export function apply(ctx: AppContext, config: Config): void {
   const storeFile = config.storeFile || join(dshHome, 'storages', SHORT + '.json')
 
   const traceFile = join(dirname(storeFile), SHORT + '.trace.log')
+  const traceOldFile = traceFile.replace(/\.log$/, '.old.log')
   const trace = (msg: string): void => {
     try {
       mkdirSync(dirname(traceFile), { recursive: true })
-      try { if (stat(traceFile).size > TRACE_MAX_BYTES) renameSync(traceFile, traceFile.replace(/\.log$/, '.old.log')) } catch { /* 首次不存在 */ }
+      try {
+        if (stat(traceFile).size > TRACE_MAX_BYTES) {
+          // 0.5.5 修复 M8：old.log 超上限先删（历史无轮转版本可能残留超大文件）再轮转
+          try { if (stat(traceOldFile).size > TRACE_OLD_MAX_BYTES) unlinkSync(traceOldFile) } catch { /* 不存在 */ }
+          renameSync(traceFile, traceOldFile)
+        }
+      } catch { /* 首次不存在 */ }
       appendFileSync(traceFile, '[' + new Date().toISOString() + '] ' + msg + '\n')
     } catch { /* ignore */ }
   }
+  // 0.5.5 修复 M8：启动时清理历史残留的超大 old.log（实测对照实例曾有 106MB）
+  try { if (stat(traceOldFile).size > TRACE_OLD_MAX_BYTES) unlinkSync(traceOldFile) } catch { /* 不存在 */ }
 
   // 读 store（分级）：损坏/不可读 → 隔离现场改名保留 + 告警 + 禁止本进程覆盖写（0.5.1 修复 H-1）
   const loaded = loadStore(storeFile)
@@ -236,8 +275,9 @@ export function apply(ctx: AppContext, config: Config): void {
     return s
   }
 
-  /** 全局 skill 禁用的 stub disposer（内存态，重启重放） */
-  const globalSkillDisposers: Array<() => void> = []
+  // 0.5.5：skill stub 辅助层整体移除（makeDisabledStub/registerGlobalSkillStubs/globalSkillDisposers）
+  // ——0.5.3 实测 agent-loop agent ctx 未注入 skills，stub 注册恒抛错且喂养 partial 重试风暴；
+  // skill 禁用唯一生效通道 = skills.snapshot patch（下方）。
 
   const persist = (): void => {
     if (storeQuarantined) { trace('persist skipped (store quarantined this process)'); return }
@@ -253,31 +293,21 @@ export function apply(ctx: AppContext, config: Config): void {
     }
   }
 
-  /** 统一禁用 stub（0.5.1：单点生成，content+body 双字段——content 是 0.2.2-rc.5 正式字段名） */
-  const makeDisabledStub = (skillName: string, globalScope: boolean): unknown => ({
-    name: skillName,
-    description: `[disabled] 该 Skill 已被用户${globalScope ? '全局' : ''}禁用（dsh-skillmcp-gate）`,
-    content: `# ${skillName}（disabled）\n\n该 Skill 已被用户${globalScope ? '全局' : ''}禁用。不要尝试使用它；如任务需要该能力，请如实告知用户。`,
-    body: `# ${skillName}（disabled）\n\n该 Skill 已被用户${globalScope ? '全局' : ''}禁用。不要尝试使用它；如任务需要该能力，请如实告知用户。`,
-  })
-
-  const registerGlobalSkillStubs = (names: string[]): number => {
-    for (const d of globalSkillDisposers) { try { d() } catch { /* ignore */ } }
-    globalSkillDisposers.length = 0
-    let ok = 0
-    for (const skillName of names) {
-      try {
-        const d = ctx.skills.register(makeDisabledStub(skillName, true) as any)
-        if (typeof d === 'function') globalSkillDisposers.push(d)
-        ok += 1
-      } catch (e) {
-        ctx.logger?.warn?.(`[${SHORT}] global skill stub failed for ${skillName}: ${e}`)
-      }
-    }
-    return ok
-  }
-
   // ── 统一 enforcement（0.5.1 修复 M-8 双实现分叉 / M-1 partial 永久短路）──
+
+  /** 按会话键找 agent：registry 键 = session-<uuid>，裸 uuid / 带前缀原文都兼容（0.5.5 修复 M-3 口径） */
+  const findAgent = (rawId: string): Agent | undefined => {
+    if (!origGet) return undefined
+    const sid = normSid(rawId)
+    const candidates = [...new Set([String(rawId ?? ''), sid, 'session-' + sid])].filter((k) => k.length > 0)
+    for (const key of candidates) {
+      try {
+        const a = origGet(key)
+        if (a) return a
+      } catch { /* 单键形状不可用则试下一个 */ }
+    }
+    return undefined
+  }
 
   const detach = (sid: string): void => {
     const prev = applied.get(sid)
@@ -287,20 +317,23 @@ export function apply(ctx: AppContext, config: Config): void {
     }
   }
 
-  type EnforceResult = { attempted: number; okTools: number; okSkills: number; failedSkills: string[]; partial: boolean }
+  type EnforceResult = { attempted: number; okTools: number; partial: boolean }
 
-  /** 对单个 agent 挂 enforcement：先拆旧再挂新，返回精确成败（调用方决定记录策略） */
+  /** 对单个 agent 挂 enforcement：先拆旧再挂新，返回精确成败（调用方决定记录策略）。
+   *  Skill 侧已收敛为 snapshot patch 单通道（0.5.5 移除 stub 层）——enforce 只管工具 restrict。 */
   const enforce = (agent: Agent, sid: string): EnforceResult => {
+    // 0.5.5 修复 H4：先读旧记录再 detach——旧实现先删后读，failCount 恒 1，退避成死代码
+    const prevRecord = applied.get(sid)
     detach(sid)
     const want = effective(sid)
-    if (want.deniedTools.length === 0 && want.deniedSkills.length === 0) {
-      return { attempted: 0, okTools: 0, okSkills: 0, failedSkills: [], partial: false }
+    if (want.deniedTools.length === 0) {
+      return { attempted: 0, okTools: 0, partial: false }
     }
-    const result: EnforceResult = { attempted: want.deniedTools.length, okTools: 0, okSkills: 0, failedSkills: [], partial: false }
+    const result: EnforceResult = { attempted: want.deniedTools.length, okTools: 0, partial: false }
     const disposers: Array<() => void> = []
-    // 1) 工具 deny：schemas() 视图过滤（未知名在 0.2.2-rc.5 会 throw——先滤掉当前不存在的，
-    //    其余 batch restrict，batch throw 再逐名降级。存在性过滤漏掉的（如 MCP 稍后连接）
-    //    通过 partial 标记让 sweep 重试（0.5.1 修复一次性失败永久化）
+    // 工具 deny：schemas() 视图过滤（未知名在 0.2.2-rc.5 会 throw——先滤掉当前不存在的，
+    // 其余 batch restrict，batch throw 再逐名降级。入口白名单（/set）已剥幽灵名，
+    // 这里剩余的 partial（如 MCP 瞬时不可用）通过标记让 sweep 按 30s 退避重试）
     let denyList = want.deniedTools
     try {
       const existing = new Set<string>(ctx.tools.schemas().map((t) => t.name))
@@ -324,67 +357,66 @@ export function apply(ctx: AppContext, config: Config): void {
       }
     }
     result.okTools = toolsOk ? denyList.length : 0
-    // 2) 技能 stub（辅助层；主生效通道是 snapshot patch。见文件头说明）
-    for (const skillName of want.deniedSkills) {
-      try {
-        const d = agent.ctx.skills.register(makeDisabledStub(skillName, false) as any)
-        if (typeof d === 'function') disposers.push(d)
-        result.okSkills += 1
-      } catch (e) {
-        result.failedSkills.push(skillName)
-        trace(`skill stub failed for ${skillName}@${sid}: ${e}`)
-      }
-    }
-    result.partial = result.okTools < want.deniedTools.length || result.failedSkills.length > 0
+    result.partial = result.okTools < want.deniedTools.length
     if (disposers.length > 0 || result.partial) {
       // 只在有成功挂载或有失败待重试时记录；partial 标记让 sweep 永不短路（但降频，见 ensureApplied）
-      const prev = applied.get(sid)
-      const failCount = result.partial ? ((prev?.failCount ?? 0) + 1) : 0
-      applied.set(sid, { disposers, key: want.deniedTools.join(',') + '|' + want.deniedSkills.join(','), partial: result.partial, failCount, lastFailAt: result.partial ? Date.now() : 0 })
+      const failCount = result.partial ? ((prevRecord?.failCount ?? 0) + 1) : 0
+      applied.set(sid, { disposers, key: want.deniedTools.join(','), partial: result.partial, failCount, lastFailAt: result.partial ? Date.now() : 0 })
     } else {
       applied.delete(sid)
     }
-    trace(`enforce(${sid}) tools=${result.okTools}/${result.attempted} skills=${result.okSkills}/${want.deniedSkills.length}${result.partial ? ' PARTIAL(will-retry)' : ''}`)
+    trace(`enforce(${sid}) tools=${result.okTools}/${result.attempted}${result.partial ? ' PARTIAL(will-retry)' : ''}`)
     return result
   }
 
   /** 幂等懒执行：deny 未变且上次无 partial 才短路。partial 永不短路（0.5.1 修复 M-1），
-   *  但连续失败 5 次后进入 30s 降频退避（0.5.2 修复 W6 重试风暴） */
-  const ensureApplied = (agent: Agent, rawSid: string): void => {
+   *  但连续失败 5 次后进入 30s 降频退避（0.5.2 修复 W6 重试风暴；0.5.5 修复 H4 使其真实可达）。
+   *  返回本轮执行结果（null = 短路或执行抛错） */
+  const ensureApplied = (agent: Agent, rawSid: string): EnforceResult | null => {
     const sid = normSid(rawSid)
-    if (!sid) return
+    if (!sid) return null
     const want = effective(sid)
-    const wantKey = want.deniedTools.join(',') + '|' + want.deniedSkills.join(',')
+    const wantKey = want.deniedTools.join(',')
     const prev = applied.get(sid)
-    if (prev && !prev.partial && prev.key === wantKey) return
-    if (prev && prev.partial && prev.failCount >= 5 && Date.now() - prev.lastFailAt < 30000) return // 退避窗口
+    if (prev && !prev.partial && prev.key === wantKey) return null
+    if (prev && prev.partial && prev.failCount >= 5 && Date.now() - prev.lastFailAt < 30000) return null // 退避窗口
     try {
-      enforce(agent, sid)
+      return enforce(agent, sid)
     } catch (e) {
       trace(`ensureApplied(${sid}) failed: ${e}`)
+      return null
     }
   }
 
-  /** /set、/apply 的立即生效入口：agent live 则立即 enforce（保持「下一条消息生效」语义兜底） */
-  const applyToSession = (sessionId: string, origGet: (id: string) => Agent | undefined): { ok: boolean; reason?: string; result?: EnforceResult } => {
+  /** /set、/apply 的立即生效入口：agent live 则立即 enforce（保持「下一条消息生效」语义兜底）。
+   *  0.5.5 修复 M-4：区分 session-not-found（无规则可应用）与 no-live-agent（有规则但无活会话） */
+  const applyToSession = (sessionId: string): { ok: boolean; reason?: string; result?: EnforceResult } => {
     const sid = normSid(sessionId)
     if (!sid) return { ok: false, reason: 'invalid-session-id' }
-    let agent: Agent | undefined
-    try { agent = origGet(sid) ?? origGet('session-' + sid) } catch { agent = undefined }
+    const sessionEntryExists = Object.prototype.hasOwnProperty.call(store.sessions, sid)
+    if (!sessionEntryExists && effective(sid).deniedTools.length === 0) return { ok: false, reason: 'session-not-found' }
+    const agent = findAgent(sessionId)
     if (!agent) { trace(`applyToSession(${sid}) no-live-agent（将由 sweep/下一条消息接管）`); return { ok: false, reason: 'no-live-agent' } }
     return { ok: true, result: enforce(agent, sid) }
   }
 
-  const applyAllLive = (origList: () => Agent[]): void => {
+  /** 全部活会话立即生效的聚合结果（0.5.5 修复 H3：/set global 不再假报成功） */
+  const applyAllLive = (origList: () => Agent[]): { attempted: number; enforced: number; partial: number } => {
+    const summary = { attempted: 0, enforced: 0, partial: 0 }
     try {
       for (const agent of origList()) {
         // 0.5.1：Agent 形状只有 id（0.2.2-rc.5 types.ts）——旧代码用 sessionId 恒空转
         const sid = normSid(String((agent as any).id ?? (agent as any).sessionId ?? ''))
-        if (sid && (store.sessions[sid] || store.global.deniedTools.length || store.global.deniedSkills.length)) {
-          ensureApplied(agent, sid)
+        if (sid && (Object.prototype.hasOwnProperty.call(store.sessions, sid) || store.global.deniedTools.length)) {
+          summary.attempted += 1
+          const r = ensureApplied(agent, sid)
+          if (r === null) continue // 短路（已生效且无变化）或执行抛错
+          if (r.partial) summary.partial += 1
+          else summary.enforced += 1
         }
       }
     } catch { /* agents 服务不可用时静默 */ }
+    return summary
   }
 
   // ── agents.get/list 包装（0.5.1：守卫防重复包装 + ctx.effect 可还原）────
@@ -447,21 +479,50 @@ export function apply(ctx: AppContext, config: Config): void {
     res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify(body))
   }
+
+  // ── API 信任门（0.5.5 修复 H1：DSH 不给插件路由套认证，route owner 自管）──
+  // 浏览器侧：Origin/Referer 必须同 authority + 拒绝跨站 sec-fetch-site + 写请求强制
+  // application/json（堵 text/plain simple request 的 CSRF 通道）。
+  // 本机脚本（无这些 header）按「与 store 文件同权限」模型放行——能打到 loopback 端口的
+  // 进程本就能直接改 store 文件；绑定非 loopback 不受支持（DSH 自身也拒绝 0.0.0.0）。
+  const sameAuthority = (urlStr: unknown, hostHeader: string): boolean => {
+    try { return new URL(String(urlStr)).host === hostHeader } catch { return false }
+  }
+  const requestTrusted = (req: any): boolean => {
+    const hostHeader = String(req.headers?.host ?? '')
+    if (!hostHeader) return false
+    const secFetchSite = String(req.headers?.['sec-fetch-site'] ?? '').toLowerCase()
+    if (secFetchSite === 'cross-site') return false
+    const origin = req.headers?.origin
+    if (origin !== undefined && origin !== 'null' && !sameAuthority(origin, hostHeader)) return false
+    const referer = req.headers?.referer
+    if (referer !== undefined && !sameAuthority(referer, hostHeader)) return false
+    return true
+  }
+
+  /** 读 body。编码化错误：超限 throw BodyTooLargeError（→413）；非法 JSON throw Error('invalid JSON body')（→400） */
+  class BodyTooLargeError extends Error {}
   const readBody = async (req: any): Promise<any> => {
     const chunks: Buffer[] = []
     let total = 0
     const MAX = 2 * 1024 * 1024 // 2MB 上限（0.5.1）
     for await (const c of req) {
       total += (c as Buffer).length
-      if (total > MAX) throw new Error('request body too large')
+      if (total > MAX) throw new BodyTooLargeError('request body too large')
       chunks.push(c as Buffer)
     }
     try {
-      const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+      // 0.5.5：剥 UTF-8 BOM 再解析；空 body 视为 {}（由上层 scope 校验给出可读错误）
+      const raw = Buffer.concat(chunks).toString('utf8')
+      const clean = raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw
+      const parsed = JSON.parse(clean || '{}') as unknown
       // 0.5.2 修复 P1：null/数组/原始值等非对象 body 归一为 {}（属性访问不再 throw 500）
       if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
       return parsed
-    } catch { return {} }
+    } catch (e) {
+      if (e instanceof BodyTooLargeError) throw e
+      throw new Error('invalid JSON body')
+    }
   }
 
   ctx.effect(() => ctx.webServer.register({
@@ -470,6 +531,13 @@ export function apply(ctx: AppContext, config: Config): void {
     handler: async (req: any, res: any) => {
       let route = ''
       try {
+        // ── 信任门（0.5.5 修复 H1）：跨站/异源请求一律 403 ──
+        if (!requestTrusted(req)) return json(res, 403, { error: 'cross-origin request rejected' })
+        // 写请求强制 application/json（堵 text/plain simple request CSRF 通道）
+        if (req.method === 'POST') {
+          const ct = String(req.headers?.['content-type'] ?? '').toLowerCase()
+          if (!ct.startsWith('application/json')) return json(res, 415, { error: 'content-type must be application/json' })
+        }
         // URL 构造入 try（0.5.1：畸形 url 不再悬挂连接）
         const url = new URL(req.url ?? '/', 'http://local')
         route = url.pathname.slice(API_PREFIX.length)
@@ -508,7 +576,11 @@ export function apply(ctx: AppContext, config: Config): void {
           }
           skills.sort((a, b) => a.name.localeCompare(b.name))
           const mcpServers = [...new Set(tools.filter((t) => t.kind === 'mcp').map((t) => t.server!))]
-          const session = store.sessions[sessionId] ?? null
+          const sidKey = sessionId
+          const session = sidKey && Object.prototype.hasOwnProperty.call(store.sessions, sidKey) ? store.sessions[sidKey] : null
+          // 0.5.5 修复 L5：applied 只序列化诊断字段（disposers 是函数，JSON 后恒 null 无信息量）
+          const ap = sessionId ? (applied.get(sessionId) ?? null) : null
+          const appliedSummary = ap ? { key: ap.key, partial: ap.partial, failCount: ap.failCount, lastFailAt: ap.lastFailAt } : null
           return json(res, 200, {
             sessionId,
             cwd,
@@ -518,77 +590,107 @@ export function apply(ctx: AppContext, config: Config): void {
             mcpServers,
             global: store.global,
             session,
-            applied: sessionId ? (applied.get(normSid(sessionId)) ?? null) : null,
-            agentLive: sessionId ? !!(origGet && (origGet(rawSessionId) ?? origGet(sessionId))) : false,
+            applied: appliedSummary,
+            // 0.5.5 修复 M-3：findAgent 兼容 registry 实际键 session-<uuid>（裸 uuid 不再恒 false）
+            agentLive: sessionId ? !!findAgent(rawSessionId) : false,
             sessionsIndex: Object.fromEntries(
               Object.entries(store.sessions).map(([k, v]) => [k, { tools: v.deniedTools.length, skills: v.deniedSkills.length }]),
             ),
           })
         }
         if (req.method === 'POST' && route === '/set') {
-          const body = await readBody(req)
+          let body: any
+          try {
+            body = await readBody(req)
+          } catch (e: any) {
+            if (e instanceof BodyTooLargeError) return json(res, 413, { error: 'request body too large (max 2MB)' })
+            // 0.5.5 修复 L1：非法 JSON 不再伪装成 scope 错误
+            return json(res, 400, { error: String(e?.message ?? e) })
+          }
           // 0.5.2 修复 W4：scope 显式白名单——未知值 400，不再静默降级为 session 写入
           const scope = body.scope === 'global' ? 'global' : body.scope === 'session' ? 'session' : null
           if (!scope) return json(res, 400, { error: `unknown scope: ${JSON.stringify(body.scope ?? null)} (expect "global" | "session")` })
           const sessionId = normSid(String(body.sessionId ?? ''))
-          if (sessionId.length > 64 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(sessionId)) {
-            // 0.5.2 修复 W3：store 键长度与形态上限（fuzz 实测 5000 字符原样落盘）
-            if (scope === 'session') return json(res, 400, { error: 'invalid sessionId (max 64 chars, [A-Za-z0-9._-])' })
+          if (scope === 'session') {
+            // 0.5.5 修复 L1/H2：缺失/超长/非法字符/保留键分别报因；保留键（constructor 等）直接拒绝
+            if (!sessionId) return json(res, 400, { error: 'sessionId required for session scope' })
+            if (isReservedKey(sessionId)) return json(res, 400, { error: 'sessionId is a reserved key' })
+            if (sessionId.length > SID_MAX_LEN) return json(res, 400, { error: `sessionId too long (max ${SID_MAX_LEN} chars)` })
+            if (!SID_RE.test(sessionId)) return json(res, 400, { error: 'invalid sessionId (chars limited to [A-Za-z0-9._-], must not start with -)' })
           }
-          const patch: DenialSet = {
-            deniedTools: normalizeSet(body.deniedTools),
-            // 0.5.2 修复 P3：deniedSkills 过滤当前 skills 快照中不存在的名字（幽灵在入口剥掉，
-            // 不再经 stub 注册「成真」出现在面板清单，也不被 UI 全量回写复活）
-            deniedSkills: normalizeSet(body.deniedSkills),
-          }
-          if (patch.deniedSkills.length > 0) {
+          // 0.5.5 修复 M1：字段可选语义——缺省 = 保持该字段现值（tools-only 调用方不再抹掉 skills 禁用）
+          const hasT = Array.isArray(body.deniedTools)
+          const hasS = Array.isArray(body.deniedSkills)
+          const current = scope === 'global'
+            ? store.global
+            : (sessionId && Object.prototype.hasOwnProperty.call(store.sessions, sessionId) ? store.sessions[sessionId] : { deniedTools: [], deniedSkills: [] })
+          const nextTools = hasT ? normalizeSet(body.deniedTools) : [...current.deniedTools]
+          const nextSkills = hasS ? normalizeSet(body.deniedSkills) : [...current.deniedSkills]
+          if (hasS && nextSkills.length > 0) {
             // 0.5.3 修复 N1（0.5.2 回归）：白名单必须与 /state 展示清单同源
-            // （snapshot + scanSkillDirs 合并）——0.5.2 仅用无 scope snapshot，
-            // dev 实测该清单与 /state 不一致（真实名被误杀 = skill 禁用静默失效）。
-            // 两清单都为空时 fail-open 不过滤（可用性优先）。
+            // （snapshot + scanSkillDirs 合并）——两清单都为空时 fail-open 不过滤（可用性优先）。
             const known = new Set<string>()
             try { for (const s of (await ctx.skills.snapshot({ cwd: process.cwd() })).skills) known.add(s.name) } catch { /* fail-open 一部分 */ }
             try { for (const s of scanSkillDirs(process.cwd(), dshHome)) known.add(s.name) } catch { /* ignore */ }
-            if (known.size > 0) patch.deniedSkills = patch.deniedSkills.filter((n) => known.has(n))
+            if (known.size > 0) {
+              for (const n of nextSkills) if (!known.has(n)) trace(`ghost skill name stripped at entry: ${n}`)
+              patchFilter(nextSkills, known)
+            }
           }
+          if (hasT && nextTools.length > 0) {
+            // 0.5.5 修复 H5/M2：tools 侧同源白名单（与 /state tools 清单一致）——
+            // 变体名/幽灵名在入口剥除，「禁不掉却显示已禁用」与 partial 重试风暴不再产生。
+            // 行为变更：deny-what-you-see（未连接 server 的工具先出现在面板再禁）。
+            const knownTools = new Set<string>()
+            try { for (const t of ctx.tools.schemas()) knownTools.add(t.name) } catch { /* fail-open */ }
+            if (knownTools.size > 0) {
+              for (const n of nextTools) if (!knownTools.has(n)) trace(`ghost tool name stripped at entry: ${n}`)
+              patchFilter(nextTools, knownTools)
+            }
+          }
+          const written: DenialSet = { deniedTools: nextTools, deniedSkills: nextSkills }
           if (scope === 'global') {
-            store.global = patch
+            store.global = { deniedTools: nextTools, deniedSkills: nextSkills }
           } else {
-            if (!sessionId) return json(res, 400, { error: 'sessionId required for session scope' })
             // 空 delta = 回归继承 → 删除会话条目
-            if (patch.deniedTools.length === 0 && patch.deniedSkills.length === 0) delete store.sessions[sessionId]
-            else store.sessions[sessionId] = patch
+            if (nextTools.length === 0 && nextSkills.length === 0) delete store.sessions[sessionId]
+            else store.sessions[sessionId] = written
           }
-          // 0.5.1 修复 H-2：session 分支的 skills 写 global，必须在此之后统一落盘
-          if (scope === 'session') store.global.deniedSkills = patch.deniedSkills
           persist()
           if (scope === 'session') {
-            // 0.5.2：session 分支不再注册 stub——幽灵名经 stub 注册会「成真」出现在面板清单
-            // （fuzz/UI 实测），且 stub 本就是辅助层；skill 生效主通道 = snapshot patch + global stub 重放
-            const r = origGet ? applyToSession(sessionId, origGet) : { ok: false as const, reason: 'wrap-unavailable' }
-            return json(res, 200, { ok: true, applied: r, globalSkills: patch.deniedSkills.length })
+            const r = origGet ? applyToSession(sessionId) : { ok: false as const, reason: 'wrap-unavailable' }
+            // 0.5.5 修复 L2：回显归一化后的生效键
+            return json(res, 200, { ok: true, scope, sessionId, applied: r })
           }
-          registerGlobalSkillStubs(store.global.deniedSkills)
-          applyAllLive(origList ?? (() => []))
-          return json(res, 200, { ok: true, applied: 'all-live' })
+          const summary = applyAllLive(origList ?? (() => []))
+          // 0.5.5 修复 H3：返回真实聚合（attempted/enforced/partial），不再硬编码 all-live 假成功
+          return json(res, 200, { ok: true, scope, applied: summary, partial: summary.partial > 0 })
         }
         if (req.method === 'POST' && route === '/apply') {
-          const body = await readBody(req)
-          const sessionId = normSid(String(body.sessionId ?? '')) // 0.5.1 修复 M-3：补 normSid
+          let body: any
+          try {
+            body = await readBody(req)
+          } catch (e: any) {
+            if (e instanceof BodyTooLargeError) return json(res, 413, { error: 'request body too large (max 2MB)' })
+            return json(res, 400, { error: String(e?.message ?? e) })
+          }
+          // 0.5.5 修复 M4：/apply 与 /set 同一套形态校验
+          const sessionId = normSid(String(body.sessionId ?? ''))
           if (!sessionId) return json(res, 400, { error: 'sessionId required' })
+          if (isReservedKey(sessionId)) return json(res, 400, { error: 'sessionId is a reserved key' })
+          if (sessionId.length > SID_MAX_LEN) return json(res, 400, { error: `sessionId too long (max ${SID_MAX_LEN} chars)` })
+          if (!SID_RE.test(sessionId)) return json(res, 400, { error: 'invalid sessionId (chars limited to [A-Za-z0-9._-], must not start with -)' })
           if (!origGet) return json(res, 503, { error: 'agents wrap unavailable' })
-          return json(res, 200, { ok: true, applied: applyToSession(sessionId, origGet) })
+          return json(res, 200, { ok: true, sessionId, applied: applyToSession(sessionId) })
         }
         return json(res, 404, { error: `unknown route ${req.method} ${route}` })
       } catch (e: any) {
+        if (e instanceof BodyTooLargeError) return json(res, 413, { error: 'request body too large (max 2MB)' })
         ctx.logger?.warn?.(`[${SHORT}] api error: ${e?.stack ?? e}`)
         return json(res, 500, { error: String(e?.message ?? e) })
       }
     },
   }), `${SHORT}: api`)
-
-  // 重放全局 skill deny（重启后 stub 消失需重挂）
-  if (store.global.deniedSkills.length > 0) registerGlobalSkillStubs(store.global.deniedSkills)
 
   // ── hook skills.snapshot：per-session 过滤被禁 skill ──────────────
   // 实测生效机制（0.2.2-rc.5）：agent-loop 把 agent 实例本身当 scope 传入，且 agent 携带 id
