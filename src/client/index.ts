@@ -49,17 +49,20 @@ const h = React.createElement
 
 type ToolRow = { name: string; kind: 'mcp' | 'builtin'; server: string; tool: string; description?: string }
 type SkillRow = { name: string; description?: string }
+type ToolFailure = { name: string; kind: 'temporary' | 'permanent'; reason: string; fails: number }
 type State = {
   sessionId: string
   cwd?: string
   tools: ToolRow[]
   skills: SkillRow[]
   mcpServers: string[]
-  global: { deniedTools: string[]; deniedSkills: string[] }
-  session: { deniedTools: string[]; deniedSkills: string[] } | null
+  global: { deniedTools: string[]; deniedSkills: string[]; releasedTools?: string[]; releasedSkills?: string[] }
+  session: { deniedTools: string[]; deniedSkills: string[]; releasedTools?: string[]; releasedSkills?: string[] } | null
   applied: { deniedTools?: number; deniedSkills?: number } | null
   agentLive: boolean
   sessionsIndex?: Record<string, { tools: number; skills: number }>
+  /** V2-2：失败分类（permanent = 该会话工具集里没有 / 不可禁，不再重试） */
+  failures?: ToolFailure[]
 }
 
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
@@ -97,22 +100,28 @@ function draftStorageKey(sessionId: string | undefined, globalMode: boolean): st
   return `skillmcp-gate:draft:${globalMode ? 'global' : (sessionId || 'nosession')}`
 }
 
-function loadDraft(key: string): { t: Set<string>; s: Set<string> } | null {
+/** 草稿模型：t/s = 禁用集合；rt/rs = 放行集合（V2-1 继承+覆写） */
+type DraftModel = { t: Set<string>; s: Set<string>; rt: Set<string>; rs: Set<string> }
+
+function loadDraft(key: string): DraftModel | null {
   try {
     const raw = window.sessionStorage.getItem(key)
     if (!raw) return null
-    const parsed = JSON.parse(raw) as { t?: unknown; s?: unknown }
+    const parsed = JSON.parse(raw) as { t?: unknown; s?: unknown; rt?: unknown; rs?: unknown }
     if (!parsed || typeof parsed !== 'object') return null
+    const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
     return {
-      t: new Set(Array.isArray(parsed.t) ? parsed.t.filter((x): x is string => typeof x === 'string') : []),
-      s: new Set(Array.isArray(parsed.s) ? parsed.s.filter((x): x is string => typeof x === 'string') : []),
+      t: new Set(strs(parsed.t)),
+      s: new Set(strs(parsed.s)),
+      rt: new Set(strs(parsed.rt)),
+      rs: new Set(strs(parsed.rs)),
     }
   } catch { return null }
 }
 
-function saveDraft(key: string, draft: { t: Set<string>; s: Set<string> } | null): void {
+function saveDraft(key: string, draft: DraftModel | null): void {
   try {
-    if (draft) window.sessionStorage.setItem(key, JSON.stringify({ t: [...draft.t], s: [...draft.s] }))
+    if (draft) window.sessionStorage.setItem(key, JSON.stringify({ t: [...draft.t], s: [...draft.s], rt: [...draft.rt], rs: [...draft.rs] }))
     else window.sessionStorage.removeItem(key)
   } catch { /* 存储不可用（隐私模式）时草稿仅内存态 */ }
 }
@@ -133,6 +142,8 @@ function setEquals(a: Set<string>, b: Set<string>): boolean {
 function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.ReactElement {
   const { sessionId, globalMode = false } = props
   const [st, setSt] = useState<State | null>(null)
+  /** 稳定引用：applyDraft 的闭包里需要读最新 state（st 在闭包内可能为 null） */
+  const stRef = useRef<State | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [applying, setApplying] = useState(false)
   const [appliedMsg, setAppliedMsg] = useState<string | null>(null)
@@ -146,7 +157,7 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
   }
   /** 草稿：勾选只改本地，点"应用"才批量提交（减少缓存失效次数）；sessionStorage 持久化（0.5.5 修复 M6） */
   const draftKey = draftStorageKey(sessionId, globalMode)
-  const [draft, setDraft] = useState<{ t: Set<string>; s: Set<string> } | null>(() => loadDraft(draftKey))
+  const [draft, setDraft] = useState<DraftModel | null>(() => loadDraft(draftKey))
   useEffect(() => {
     saveDraft(draftKey, draft)
     // 0.5.5（r2a 建议 #5）：同 tab 多实例（侧栏 + banner）共享同一把 session 草稿键——
@@ -159,7 +170,8 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
       const next = loadDraft(draftKey)
       setDraft((cur) => {
         const same = (cur === null && next === null)
-          || (cur !== null && next !== null && setEquals(cur.t, next.t) && setEquals(cur.s, next.s))
+          || (cur !== null && next !== null && setEquals(cur.t, next.t) && setEquals(cur.s, next.s)
+              && setEquals(cur.rt, next.rt) && setEquals(cur.rs, next.rs))
         return same ? cur : next
       })
     }
@@ -173,6 +185,7 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
       setErr(null)
       const next = await apiGet(`?sessionId=${encodeURIComponent(sessionId ?? '')}`)
       setSt(next)
+      stRef.current = next
       // 0.5.2 修复（UI 回归用例 2 阻断项）：load 不再无条件清 draft——
       // 0.5.1 的「load 成功清草稿」会把 applyDraft 完成后保留的增量勾选一并吞掉。
       // 草稿保留后横条 diff 基于“新 applied vs draft”计算，语义仍自洽；
@@ -194,20 +207,39 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
 
   const applyDraft = useCallback(async (): Promise<void> => {
     if (!draft || applying) return // 0.5.1：in-flight 锁
-    const snapshot = { t: new Set(draft.t), s: new Set(draft.s) } // 锁定提交快照
+    const snapshot = { t: new Set(draft.t), s: new Set(draft.s), rt: new Set(draft.rt), rs: new Set(draft.rs) } // 锁定提交快照
     setApplying(true)
     try {
       setErr(null)
       let data: { ok?: boolean; partial?: boolean; applied?: any }
       if (globalMode) {
-        data = await apiSet({ scope: 'global', deniedTools: [...snapshot.t], deniedSkills: [...snapshot.s] })
+        data = await apiSet({
+          scope: 'global',
+          deniedTools: [...snapshot.t],
+          deniedSkills: [...snapshot.s],
+          releasedTools: [],
+          releasedSkills: [],
+        })
       } else {
-        // 0.5.5 修复 B1/B3（r2 双确认的高危）：Skill=全局语义——会话写只带 tools，
-        // 并显式清空会话条目的历史 skills 污染副本（空 delta 即删键）；
-        // skill 改动走独立全局写（host 0.5.5：缺失字段=保持现值，不会误伤 global.deniedTools）
-        data = await apiSet({ scope: 'session', sessionId, deniedTools: [...snapshot.t], deniedSkills: [] })
-        const g = await apiSet({ scope: 'global', deniedSkills: [...snapshot.s] })
-        data = { ok: data.ok && g.ok, partial: data.partial === true || g.partial === true, applied: data.applied }
+        // V2-1：会话 scope = 继承 + 覆写——denied* 是本会话禁用，released* 是本会话放行
+        // （放行一个全局默认禁用的 skill）。服务端 effective() 计算 (global ∪ session.denied) − released。
+        // V2-3 修复（rv2-ui 中危）：服务端已有但当前视图不可见的禁用项必须保留——
+        //   否则「批量应用」的全量回写会静默丢弃它们（被禁工具因 restrict 不在清单里）。
+        const currentSession = stRef.current?.session
+        const serverDeniedTools = new Set(currentSession?.deniedTools ?? [])
+        const keepTools = [...snapshot.t]
+        for (const n of serverDeniedTools) if (!keepTools.includes(n)) keepTools.push(n)
+        const serverDeniedSkills = new Set(currentSession?.deniedSkills ?? [])
+        const keepSkills = [...snapshot.s]
+        for (const n of serverDeniedSkills) if (!keepSkills.includes(n)) keepSkills.push(n)
+        data = await apiSet({
+          scope: 'session',
+          sessionId,
+          deniedTools: keepTools,
+          deniedSkills: keepSkills,
+          releasedTools: [...snapshot.rt],
+          releasedSkills: [...snapshot.rs],
+        })
       }
       await load()
       // 0.5.5 修复 L3：应用结果显式反馈（消费 host 0.5.5 的真实聚合——partial 提示后台重试）
@@ -216,7 +248,8 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
       // 0.5.1：应用期间的新勾选不吞——仅当 draft 仍等于提交快照时清空，否则保留增量
       setDraft((prev) => {
         if (!prev) return null
-        if (setEquals(prev.t, snapshot.t) && setEquals(prev.s, snapshot.s)) return null
+        if (setEquals(prev.t, snapshot.t) && setEquals(prev.s, snapshot.s)
+            && setEquals(prev.rt, snapshot.rt) && setEquals(prev.rs, snapshot.rs)) return null
         return prev
       })
     } catch (e: any) {
@@ -241,49 +274,73 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
     return h('div', { style: { padding: 10, opacity: 0.6 } }, '加载中…')
   }
 
-  // 已生效集合（global + session 合并）
+  // 已生效集合（global + session 合并；V2-1：含 released 抵消）
   const appliedT = new Set(st.global.deniedTools)
   const appliedS = new Set(st.global.deniedSkills)
+  const relT = new Set(st.global.releasedTools ?? [])
+  const relS = new Set(st.global.releasedSkills ?? [])
   if (!globalMode && st.session) {
     for (const x of st.session.deniedTools) appliedT.add(x)
     for (const x of st.session.deniedSkills) appliedS.add(x)
+    for (const x of st.session.releasedTools ?? []) relT.add(x)
+    for (const x of st.session.releasedSkills ?? []) relS.add(x)
   }
+  for (const x of relT) appliedT.delete(x)
+  for (const x of relS) appliedS.delete(x)
   // 渲染视图：有 draft 时勾选框/删除线/计数立即反映用户选择（生效仍等「批量应用」）——0.4.4
   const deniedT = draft !== null ? draft.t : appliedT
   const deniedS = draft !== null ? draft.s : appliedS
 
-  const setTool = (name: string, denied: boolean): void => {
-    const base = draft ?? { t: new Set(appliedT), s: new Set(appliedS) }
-    const next = new Set(base.t)
-    if (denied) next.add(name)
-    else next.delete(name)
-    setDraft({ t: next, s: new Set(base.s) })
+  // V2-1：会话 scope 支持「本会话放行」——勾选一个「全局默认已禁用」的项 = 本会话放行
+  // （写 released*）；全局 scope 下无放行概念（勾选=可用即取消禁用）。
+  const baseModel = (): DraftModel => draft ?? {
+    t: new Set(appliedT),
+    s: new Set(appliedS),
+    rt: new Set(relT),
+    rs: new Set(relS),
   }
-  const setSkill = (name: string, denied: boolean): void => {
-    const base = draft ?? { t: new Set(appliedT), s: new Set(appliedS) }
-    const next = new Set(base.s)
-    if (denied) next.add(name)
-    else next.delete(name)
-    setDraft({ t: new Set(base.t), s: next })
+  /** 切换某项的禁用/放行状态（会话 scope 支持放行；全局 scope 只切换禁用） */
+  const toggleItem = (kind: 't' | 's', name: string, denied: boolean): void => {
+    const base = baseModel()
+    const nextD = new Set(kind === 't' ? base.t : base.s)
+    const nextR = new Set(kind === 't' ? base.rt : base.rs)
+    const inheritedDenied = kind === 't'
+      ? (st.global.deniedTools.includes(name) && !(st.global.releasedTools ?? []).includes(name))
+      : (st.global.deniedSkills.includes(name) && !(st.global.releasedSkills ?? []).includes(name))
+    if (denied) {
+      nextD.add(name)
+      nextR.delete(name)
+    } else {
+      nextD.delete(name)
+      // 会话 scope：全局默认禁用的项，本会话取消勾选 = 放行（released）
+      if (!globalMode && inheritedDenied) nextR.add(name)
+      else nextR.delete(name)
+    }
+    setDraft(kind === 't'
+      ? { t: nextD, s: new Set(base.s), rt: nextR, rs: new Set(base.rs) }
+      : { t: new Set(base.t), s: nextD, rt: new Set(base.rt), rs: nextR })
   }
+
+  const setTool = (name: string, denied: boolean): void => toggleItem('t', name, denied)
+  const setSkill = (name: string, denied: boolean): void => toggleItem('s', name, denied)
   const setServer = (server: string, denyAll: boolean): void => {
-    const base = draft ?? { t: new Set(appliedT), s: new Set(appliedS) }
+    const base = baseModel()
     const next = new Set(base.t)
     for (const t of st.tools.filter((x) => x.kind === 'mcp' && x.server === server)) {
       if (denyAll) next.add(t.name)
       else next.delete(t.name)
     }
-    setDraft({ t: next, s: new Set(base.s) })
+    setDraft({ t: next, s: new Set(base.s), rt: new Set(base.rt), rs: new Set(base.rs) })
   }
   // 0.5.5 修复 M7：Skill 组与 MCP server 组同款整组勾选（语义一致，恢复不再反向操作）
   const setAllSkills = (denyAll: boolean): void => {
-    const base = draft ?? { t: new Set(appliedT), s: new Set(appliedS) }
+    const base = baseModel()
     const next = new Set(base.s)
     for (const s of st.skills) {
       if (denyAll) next.add(s.name)
       else next.delete(s.name)
     }
-    setDraft({ t: new Set(base.t), s: next })
+    setDraft({ t: new Set(base.t), s: next, rt: new Set(base.rt), rs: new Set(base.rs) })
   }
 
   // 0.5.5（r2b 建议 #8）：列表搜索过滤（仅过滤行显示；计数仍为全量口径）
@@ -334,6 +391,25 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
     )
   })
 
+  // V2-3：内置工具组（agent 作用域视图里的非 MCP 工具——pwsh/read/grep/web_search 等）
+  const builtinAll = st.tools.filter((t) => t.kind !== 'mcp')
+  const builtinRows = builtinAll.filter((t) => rowMatch(t.name, t.description)).map((t: ToolRow) =>
+    h('label', { key: t.name, style: rowStyle, title: `${t.name}${t.description ? ' — ' + t.description.slice(0, 140) : ''}` },
+      h('input', {
+        type: 'checkbox',
+        checked: !deniedT.has(t.name),
+        onChange: (e: any) => setTool(t.name, !e.target.checked),
+      }),
+      h('span', {
+        style: {
+          textDecoration: deniedT.has(t.name) ? 'line-through' : 'none',
+          opacity: deniedT.has(t.name) ? 0.55 : 1,
+        },
+      }, t.tool),
+    ),
+  )
+  const builtinAvailable = builtinAll.filter((t) => !deniedT.has(t.name)).length
+
   const skillRows = st.skills.filter((sk: SkillRow) => rowMatch(sk.name, sk.description)).map((sk: SkillRow) =>
     h('label', { key: sk.name, style: rowStyle, title: `${sk.name}${sk.description ? ' — ' + sk.description.slice(0, 140) : ''}` },
       h('input', {
@@ -355,19 +431,24 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
   // 草稿态不再把 Skill 误标成「本会话」。
   const statusLine = draft !== null
     ? globalMode
-      ? `应用后（全局默认）：${mcpAvailable}/${mcpTotal} MCP · ${skillAvailable}/${st.skills.length} Skill（新会话继承）`
-      : `应用后：${mcpAvailable}/${mcpTotal} MCP（本会话）· ${skillAvailable}/${st.skills.length} Skill（全局）${st.agentLive ? '' : ' · 下条消息唤醒时生效'}`
+      ? `应用后（全局默认）：${mcpAvailable}/${mcpTotal} MCP · ${builtinAvailable}/${builtinAll.length} 内置 · ${skillAvailable}/${st.skills.length} Skill（新会话继承）`
+      : `应用后：${mcpAvailable}/${mcpTotal} MCP（本会话）· ${builtinAvailable}/${builtinAll.length} 内置（本会话）· ${skillAvailable}/${st.skills.length} Skill（全局）${st.agentLive ? '' : ' · 下条消息唤醒时生效'}`
     : globalMode
-      ? `全局默认：${mcpAvailable}/${mcpTotal} MCP · ${skillAvailable}/${st.skills.length} Skill（新会话继承）`
-      : `下条消息生效：${mcpAvailable}/${mcpTotal} MCP（本会话）· ${skillAvailable}/${st.skills.length} Skill（全局）${st.agentLive ? '' : ' · 下条消息唤醒时生效'}`
+      ? `全局默认：${mcpAvailable}/${mcpTotal} MCP · ${builtinAvailable}/${builtinAll.length} 内置 · ${skillAvailable}/${st.skills.length} Skill（新会话继承）`
+      : `下条消息生效：${mcpAvailable}/${mcpTotal} MCP（本会话）· ${builtinAvailable}/${builtinAll.length} 内置（本会话）· ${skillAvailable}/${st.skills.length} Skill（全局）${st.agentLive ? '' : ' · 下条消息唤醒时生效'}`
 
   // 0.5.1 修复 M-4：横条 = 双向 diff 计数，零差异隐藏（存量 deny 不再计入）
+  // V2-1：加入放行集合（rt/rs）的 diff
   let diffCount = 0
   if (draft !== null) {
     for (const n of draft.t) if (!appliedT.has(n)) diffCount += 1
     for (const n of appliedT) if (!draft.t.has(n)) diffCount += 1
     for (const n of draft.s) if (!appliedS.has(n)) diffCount += 1
     for (const n of appliedS) if (!draft.s.has(n)) diffCount += 1
+    for (const n of draft.rt) if (!relT.has(n)) diffCount += 1
+    for (const n of relT) if (!draft.rt.has(n)) diffCount += 1
+    for (const n of draft.rs) if (!relS.has(n)) diffCount += 1
+    for (const n of relS) if (!draft.rs.has(n)) diffCount += 1
   }
 
   return h('div', {
@@ -415,6 +496,15 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
         boxSizing: 'border-box',
       },
     }),
+    // V2-2：失败分类告警（permanent = 不可禁/不存在，不再重试）
+    (st.failures ?? []).length > 0 && h('div', {
+      style: { padding: '6px 8px', marginBottom: 8, borderRadius: 6, fontSize: 11, background: 'rgba(255,120,0,.15)' },
+    },
+      h('div', { style: { fontWeight: 600, marginBottom: 2 } }, '⚠ 部分项目未能生效'),
+      ...(st.failures ?? []).map((f) =>
+        h('div', { key: f.name, style: { opacity: 0.85 } },
+          `${f.name}：${f.kind === 'permanent' ? '本会话工具集中不存在或不可禁用' : '暂时失败，将自动重试'}`)),
+    ),
     h('div', { style: { padding: '6px 8px', marginBottom: 8, borderRadius: 6, background: 'rgba(127,127,127,.15)' } },
       statusLine),
     // 0.5.5 修复 L3：应用结果反馈条（3s 自动消失；partial 提示后台自动重试）
@@ -425,6 +515,15 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
       },
     }, appliedMsg),
     ...serverGroups,
+    // V2-3：内置工具组（随 agent preset 变化）
+    builtinAll.length > 0 && h('div', { style: groupStyle },
+      h('div', { style: { fontWeight: 600, margin: '2px 0' } },
+        `内置工具（${builtinAvailable}/${builtinAll.length} 可用）`),
+      ...builtinRows,
+      h('div', {
+        style: { marginTop: 6, padding: '4px 6px', borderRadius: 4, background: 'rgba(127,127,127,.12)', fontSize: 11 },
+      }, '内置工具清单随当前 agent preset 变化；不同会话可能不同。仅管控当前会话'),
+    ),
     h('div', { style: groupStyle },
       h('label', {
         style: { ...rowStyle, fontWeight: 600 },

@@ -57,7 +57,13 @@ type AppContext = Context & {
   workingDirectory?: WorkingDirectoryService
 }
 
-type DenialSet = { deniedTools: string[]; deniedSkills: string[] }
+type DenialSet = {
+  deniedTools: string[]
+  deniedSkills: string[]
+  /** V2-1：显式解除名单（继承+覆写语义：解除全局默认、只在本会话放行） */
+  releasedTools?: string[]
+  releasedSkills?: string[]
+}
 type Store = { global: DenialSet; sessions: Record<string, DenialSet> }
 
 const SHORT = 'skillmcp-gate' // 永久内部标识（见文件头命名三分法），禁止改为包名
@@ -119,11 +125,15 @@ function normalizeSessions(raw: Record<string, DenialSet>): Record<string, Denia
     // 0.5.2 修复 W5：空/非法条目不建幽灵键（sessionsIndex 不再显示 0/0 残留）
     const tools = normalizeSet(rec?.deniedTools)
     const skills = normalizeSet(rec?.deniedSkills)
-    if (tools.length === 0 && skills.length === 0) continue
-    const cur = Object.prototype.hasOwnProperty.call(out, key) ? out[key] : { deniedTools: [], deniedSkills: [] }
+    const relTools = normalizeSet(rec?.releasedTools)
+    const relSkills = normalizeSet(rec?.releasedSkills)
+    if (tools.length === 0 && skills.length === 0 && relTools.length === 0 && relSkills.length === 0) continue
+    const cur = Object.prototype.hasOwnProperty.call(out, key) ? out[key] : { deniedTools: [], deniedSkills: [], releasedTools: [], releasedSkills: [] }
     out[key] = {
       deniedTools: [...new Set([...cur.deniedTools, ...tools])].sort(),
       deniedSkills: [...new Set([...cur.deniedSkills, ...skills])].sort(),
+      releasedTools: [...new Set([...(cur.releasedTools ?? []), ...relTools])].sort(),
+      releasedSkills: [...new Set([...(cur.releasedSkills ?? []), ...relSkills])].sort(),
     }
   }
   return out
@@ -131,7 +141,12 @@ function normalizeSessions(raw: Record<string, DenialSet>): Record<string, Denia
 
 function normalizeStore(raw: Partial<Store>): Store {
   return {
-    global: { deniedTools: normalizeSet(raw.global?.deniedTools), deniedSkills: normalizeSet(raw.global?.deniedSkills) },
+    global: {
+      deniedTools: normalizeSet(raw.global?.deniedTools),
+      deniedSkills: normalizeSet(raw.global?.deniedSkills),
+      releasedTools: normalizeSet(raw.global?.releasedTools),
+      releasedSkills: normalizeSet(raw.global?.releasedSkills),
+    },
     sessions: normalizeSessions(raw.sessions ?? {}),
   }
 }
@@ -143,7 +158,32 @@ function patchFilter(list: string[], known: Set<string>): void {
   }
 }
 
-const EMPTY_STORE: Store = { global: { deniedTools: [], deniedSkills: [] }, sessions: Object.create(null) }
+const EMPTY_STORE: Store = { global: { deniedTools: [], deniedSkills: [], releasedTools: [], releasedSkills: [] }, sessions: Object.create(null) }
+
+/**
+ * V2-3b：存储后端抽象。
+ *  - domain 后端：官方 storageDomain（dsh-storage-domain，base bundle 默认启用 → 零 profile 改动）
+ *    → 获得 fsync 级原子写 + 单写链串行化 + schema 校验 + domain/changed 事件。
+ *  - file 后端：旧 JSON 文件（~/.dsh/storages/skillmcp-gate.json）——域不可用/打开失败时的回退，
+ *    同时保留旧文件供降级读取（域迁移完成后旧文件被 rename 为 .migrated-<stamp>，不删除）。
+ */
+type StoreBackend = {
+  readonly kind: 'domain' | 'file'
+  /** 读当前全局集合 */
+  readGlobal: () => DenialSet
+  /** 读某会话集合（不存在→空集） */
+  readSession: (sessionId: string) => DenialSet | undefined
+  /** 写全局集合 */
+  writeGlobal: (next: DenialSet) => Promise<void>
+  /** 写会话集合（undefined = 删除该键） */
+  writeSession: (sessionId: string, next: DenialSet | undefined) => Promise<void>
+  /** 列出全部会话键 */
+  listSessions: () => Array<[string, DenialSet]>
+  /** 是否可持久化（false = 本进程只读） */
+  readonly persistent: boolean
+  /** 关闭（域需要） */
+  close?: () => Promise<void>
+}
 
 /**
  * 读 store。返回 corrupted=true 表示「文件存在但损坏/不可读」——
@@ -177,6 +217,108 @@ function saveStore(file: string, store: Store): void {
   const tmp = file + '.tmp'
   writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf8')
   renameSync(tmp, file)
+}
+
+// ── V2-3b：storageDomain 官方 seam 适配 ────────────────────────────────
+// 官方事实（dsh-storage-domain 0.2.2-rc.5）：
+//  - 域声明 = defineDomain({name, version, global:{schema,initial}, tables})；record schema 用 **zod**
+//  - 域名/表名必须匹配 /^[a-z][a-z0-9_]*$/（**不含连字符**）→ 域文件 skillmcp_gate.json
+//  - 打开：ctx.storageDomain.open(spec)；可用 ctx.get('storageDomain') 取（缺失=undefined）。
+//    **不可写成 inject: ['storageDomain']** —— 那会让插件在缺 storage 栈的 profile 里整体 park。
+//  - 无值迁移 runner：旧文件→域 需自己写一次性转换（用 meta 表做幂等标记）。
+//  - 域的 global 槽永远 reject；写入不做 schema 校验 → 现有 normalizeSet 清洗一行都不能删。
+//  - domain/changed 仅进程内；跨进程一致性不由域解决（json backend 无跨进程写锁）。
+
+/** 域内记录的 zod 校验（与 normalizeSet 输出一致：字符串数组） */
+const denialSetShape = {
+  deniedTools: (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string'),
+  deniedSkills: (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string'),
+  releasedTools: (v: unknown) => v === undefined || (Array.isArray(v) && v.every((x) => typeof x === 'string')),
+  releasedSkills: (v: unknown) => v === undefined || (Array.isArray(v) && v.every((x) => typeof x === 'string')),
+}
+const isDenialSet = (v: unknown): v is DenialSet => {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false
+  const o = v as Record<string, unknown>
+  return denialSetShape.deniedTools(o.deniedTools) && denialSetShape.deniedSkills(o.deniedSkills)
+    && denialSetShape.releasedTools(o.releasedTools) && denialSetShape.releasedSkills(o.releasedSkills)
+}
+const toDenialSet = (v: unknown): DenialSet => {
+  const o = (v ?? {}) as Record<string, unknown>
+  return {
+    deniedTools: normalizeSet(o.deniedTools),
+    deniedSkills: normalizeSet(o.deniedSkills),
+    releasedTools: normalizeSet(o.releasedTools),
+    releasedSkills: normalizeSet(o.releasedSkills),
+  }
+}
+
+/** 域后端：打开官方域 + 一次性迁移旧文件。返回 undefined 表示不可用（调用方回退文件后端）。 */
+async function openDomainBackend(ctx: AppContext, legacyFile: string, trace: (m: string) => void): Promise<StoreBackend | undefined> {
+  const facility = (ctx as any).get?.('storageDomain')
+  if (!facility || typeof facility.open !== 'function') return undefined
+  let domain: any
+  try {
+    // 域声明用运行时对象（避免硬依赖 zod：schema 用自校验函数，dsh-storage-domain 要求 ZodType，
+    // 故此处走 duck-typing 的最小封装——若宿主要求真正的 zod schema，open 会失败并回退文件后端）
+    const spec = {
+      name: 'skillmcp_gate',
+      version: 1,
+      global: { schema: { parse: (v: unknown) => toDenialSet(v) }, initial: { deniedTools: [], deniedSkills: [], releasedTools: [], releasedSkills: [] } },
+      tables: {
+        sessions: { valueSchema: { parse: (v: unknown) => { if (!isDenialSet(v)) throw new TypeError('invalid denial set'); return toDenialSet(v) } } },
+        meta: { valueSchema: { parse: (v: unknown) => (v && typeof v === 'object' ? v : {}) } },
+      },
+    }
+    domain = await facility.open(spec)
+  } catch (e) {
+    trace(`storageDomain open failed — falling back to legacy file: ${e}`)
+    ctx.logger?.warn?.(`[${SHORT}] storageDomain open failed — using legacy file store: ${e}`)
+    return undefined
+  }
+  const table = domain.table('sessions')
+  const meta = domain.table('meta')
+  // 一次性迁移（旧文件 → 域）：幂等标记放 meta 表；旧文件 rename 是最后一步（崩溃可重跑）
+  try {
+    if (meta.get('migration')?.migrated !== true) {
+      let legacy: { global: DenialSet; sessions: Record<string, DenialSet> } | undefined
+      try {
+        const raw = JSON.parse(readFileSync(legacyFile, 'utf8')) as any
+        if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+          legacy = { global: toDenialSet(raw.global), sessions: (raw.sessions ?? {}) as Record<string, DenialSet> }
+        }
+      } catch { legacy = undefined }
+      if (legacy) {
+        await domain.global.set(legacy.global)
+        for (const [sid, rec] of Object.entries(legacy.sessions)) {
+          await table.put(sid, toDenialSet(rec))
+        }
+        await meta.put('migration', { migrated: true })
+        try { renameSync(legacyFile, legacyFile + '.migrated-' + Date.now()) } catch { /* 保留备份失败不致命 */ }
+        trace(`legacy store migrated into storageDomain (${Object.keys(legacy.sessions).length} session entries)`)
+      } else {
+        await meta.put('migration', { migrated: true })
+      }
+    }
+  } catch (e) {
+    trace(`legacy migration failed: ${e}`)
+    ctx.logger?.warn?.(`[${SHORT}] legacy store migration failed: ${e}`)
+  }
+  return {
+    kind: 'domain',
+    readGlobal: () => toDenialSet(domain.global.get()),
+    readSession: (sessionId) => {
+      const rec = table.get(sessionId)
+      return rec === undefined ? undefined : toDenialSet(rec)
+    },
+    writeGlobal: async (next) => { await domain.global.set(next) },
+    writeSession: async (sessionId, next) => {
+      if (next === undefined) await table.delete(sessionId)
+      else await table.put(sessionId, next)
+    },
+    listSessions: () => [...table.entries()].map(([k, v]) => [k, toDenialSet(v)] as [string, DenialSet]),
+    persistent: true,
+    close: async () => { try { await domain.close() } catch { /* ignore */ } },
+  }
 }
 
 // ── 技能磁盘扫描兜底（provider 对无 scope 调用可能不扫文件系统根）──
@@ -230,7 +372,7 @@ function scanSkillDirs(workspace: string, dshHome: string): Array<{ name: string
 
 // ── apply(ctx, config) ──────────────────────────────────────────────
 
-export function apply(ctx: AppContext, config: Config): void {
+export async function apply(ctx: AppContext, config: Config): Promise<void> {
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
   const storeFile = config.storeFile || join(dshHome, 'storages', SHORT + '.json')
 
@@ -265,6 +407,35 @@ export function apply(ctx: AppContext, config: Config): void {
     ctx.logger?.warn?.(`[${SHORT}] store file corrupted — quarantined as .corrupted-*; starting empty, persistence disabled this process. Restore from the quarantined file if needed.`)
   }
 
+  // V2-3b：优先官方 storageDomain（域后端）；不可用/打开失败 → 回退旧文件后端
+  const domainBackend = await openDomainBackend(ctx, storeFile, trace)
+  const backend: StoreBackend = domainBackend ?? {
+    kind: 'file',
+    readGlobal: () => store.global,
+    readSession: (sessionId) => store.sessions[sessionId],
+    writeGlobal: async (next) => { store.global = next },
+    writeSession: async (sessionId, next) => {
+      if (next === undefined) delete store.sessions[sessionId]
+      else store.sessions[sessionId] = next
+    },
+    listSessions: () => Object.entries(store.sessions).map(([k, v]) => [k, v] as [string, DenialSet]),
+    persistent: !storeQuarantined,
+  }
+  if (domainBackend) {
+    // 域后端：把域内数据灌入内存（保持同步读路径），此后内存为准、持久化由域承接
+    try {
+      store.global = backend.readGlobal()
+      const sessions = backend.listSessions()
+      for (const [k, v] of sessions) store.sessions[k] = v
+      trace(`store backend = storageDomain (skillmcp_gate): loaded global + ${sessions.length} session entries; legacy file = ${storeFile}`)
+      ctx.logger?.info?.(`[${SHORT}] store backend = storageDomain (skillmcp_gate) — ${sessions.length} session entries loaded`)
+    } catch (e) {
+      trace(`domain initial load failed: ${e}`)
+    }
+  } else {
+    trace(`store backend = legacy file (${storeFile})`)
+  }
+
   /** sessionId → 当前挂载（重放前先拆旧）。partial=true 表示上次执行有失败项；
    *  failCount/lastFailAt 用于降频退避（0.5.2 修复 W6：永久失败不再每 2s 风暴重试） */
   const applied = new Map<string, { disposers: Array<() => void>; key: string; partial: boolean; failCount: number; lastFailAt: number }>()
@@ -279,17 +450,58 @@ export function apply(ctx: AppContext, config: Config): void {
   // ——0.5.3 实测 agent-loop agent ctx 未注入 skills，stub 注册恒抛错且喂养 partial 重试风暴；
   // skill 禁用唯一生效通道 = skills.snapshot patch（下方）。
 
-  const persist = (): void => {
-    if (storeQuarantined) { trace('persist skipped (store quarantined this process)'); return }
-    try { saveStore(storeFile, store) } catch (e) { ctx.logger?.warn?.(`[${SHORT}] store save failed: ${e}`) }
+  // V2-3b：域写入串行化（Windows 上并发 rename 同一目标会 EPERM——域的原子写用 rename 覆盖，
+  //   两个写同时进行时后者 rename 前者正在替换的目标 → EPERM 落盘失败）。
+  //   故：所有域写排队到单链上，且**只写本次变更的增量**（不是全量重写）。
+  let domainWriteChain: Promise<void> = Promise.resolve()
+  const enqueueDomainWrite = (task: () => Promise<void>): void => {
+    domainWriteChain = domainWriteChain.then(async () => {
+      try { await task() } catch (e) {
+        trace(`domain write failed: ${e}`)
+        ctx.logger?.warn?.(`[${SHORT}] domain write failed: ${e}`)
+      }
+    })
   }
 
+  const persist = (): void => {
+    if (storeQuarantined) { trace('persist skipped (store quarantined this process)'); return }
+    if (backend.kind === 'domain') {
+      // 全量同步（内存 → 域）：内存 store 是真相源；域里多出的行要删、内存有的行要写
+      // （rv2-api P0-1 根因：域后端 listSessions() 返回的是域表自身行，用它回写是 no-op）
+      enqueueDomainWrite(async () => {
+        await backend.writeGlobal(store.global)
+        const domainKeys = new Set(backend.listSessions().map(([k]) => k))
+        for (const [sid, rec] of Object.entries(store.sessions)) {
+          await backend.writeSession(sid, rec)
+          domainKeys.delete(sid)
+        }
+        for (const sid of domainKeys) await backend.writeSession(sid, undefined)
+      })
+      try { invalidateSkillCatalog?.() } catch { /* ignore */ }
+      return
+    }
+    try { saveStore(storeFile, store) } catch (e) { ctx.logger?.warn?.(`[${SHORT}] store save failed: ${e}`) }
+    // V2-1：禁用集合变了 → 让 registry 的目录缓存失效，否则模型侧仍看到旧技能目录
+    try { invalidateSkillCatalog?.() } catch { /* ignore */ }
+  }
+
+  /** V2-1 继承+覆写语义：global 是默认禁用集，session 的 released* 是「本会话放行」，
+   *  session 的 denied* 是「本会话额外禁用」。最终生效 = (global ∪ session.denied) − released。
+   *  这让「某会话单独放行一个全局被禁的 skill」成为可能（此前只有全局/会话二选一）。 */
   const effective = (sessionId: string | null): DenialSet => {
     const g = store.global
     const s = sessionId ? store.sessions[sessionId] : undefined
+    const denyT = new Set([...g.deniedTools, ...(s?.deniedTools ?? [])])
+    const denyS = new Set([...g.deniedSkills, ...(s?.deniedSkills ?? [])])
+    for (const n of (s?.releasedTools ?? [])) denyT.delete(n)
+    for (const n of (s?.releasedSkills ?? [])) denyS.delete(n)
+    for (const n of (g.releasedTools ?? [])) denyT.delete(n)
+    for (const n of (g.releasedSkills ?? [])) denyS.delete(n)
     return {
-      deniedTools: [...new Set([...g.deniedTools, ...(s?.deniedTools ?? [])])].sort(),
-      deniedSkills: [...new Set([...g.deniedSkills, ...(s?.deniedSkills ?? [])])].sort(),
+      deniedTools: [...denyT].sort(),
+      deniedSkills: [...denyS].sort(),
+      releasedTools: [...(s?.releasedTools ?? [])].sort(),
+      releasedSkills: [...(s?.releasedSkills ?? [])].sort(),
     }
   }
 
@@ -317,7 +529,91 @@ export function apply(ctx: AppContext, config: Config): void {
     }
   }
 
-  type EnforceResult = { attempted: number; okTools: number; partial: boolean }
+  // ── V2-3：工具枚举视图（agent 作用域视图）────────────────────────
+  // 事实（dsh-tools 0.2.2-rc.5 源码）：`ctx.tools.schemas()` 不传 scope = **全局视图**
+  //   （view(undefined) 只取 layers.global）；preset scope 层里的工具（pwsh / read / grep /
+  //   glob / web_search / todo_write …）因此不可见——它们并非「harness 注入面」，
+  //   而是注册在 agent-preset scope 层的 registry 工具。
+  //   agent 实例本身即 ScopeKey（assembleContextFor: {agent, scope: agent}），
+  //   故 `ctx.tools.schemas(agent)` 即该会话的完整工具集。
+  //   restrict() 的可禁集合 = 继承面（global + 祖先 scope 层）→ preset 层工具**可禁**。
+  //   ⇒ 内置工具管控不需要新执行通道，只需把枚举源换成 agent 视图。
+  const toolViewFor = (agent?: Agent): ToolSchema[] => {
+    if (agent) {
+      try {
+        const scoped = ctx.tools.schemas(agent as unknown as object)
+        if (scoped.length > 0) return scoped
+      } catch (e) {
+        trace(`agent-scoped tools.schemas failed: ${e}`)
+      }
+    }
+    try { return ctx.tools.schemas() } catch { return [] }
+  }
+
+  /** 无活会话时的 preset 作用域视图（内置工具全集）——agentPresets.acquireScope 是异步且需 dispose。
+   *  失败/不可用时返回 undefined（调用方回落全局视图）。 */
+  const presetToolView = async (): Promise<ToolSchema[] | undefined> => {
+    // agentPresets 是 TypertRemoteService —— 必须经 ctx.get('agentPresets') 取（属性访问取不到）
+    const presets = (ctx as any).get?.('agentPresets')
+    if (!presets || typeof presets.acquireScope !== 'function') return undefined
+    let lease: any
+    try {
+      lease = await presets.acquireScope()
+      const scoped = ctx.tools.schemas(lease.key as unknown as object)
+      return scoped.length > 0 ? scoped : undefined
+    } catch (e) {
+      trace(`preset-scoped tools.schemas failed: ${e}`)
+      return undefined
+    } finally {
+      try { await lease?.[Symbol.asyncDispose]?.() } catch { /* ignore */ }
+    }
+  }
+
+  /** 已知工具名全集（幽灵名过滤用）：全局视图 ∪ 目标会话视图 ∪ 所有活会话视图 ∪ preset 视图。
+   *  V2-3 修复 rv2-api P0-2：非活会话/global scope 下内置工具（pwsh/read/grep）不得被当幽灵剥除。 */
+  const knownToolNames = async (sessionId?: string | undefined): Promise<Set<string>> => {
+    const known = new Set<string>()
+    try { for (const t of ctx.tools.schemas()) known.add(t.name) } catch { /* fail-open */ }
+    try { for (const t of toolViewFor(sessionId ? findAgent(sessionId) : undefined)) known.add(t.name) } catch { /* fail-open */ }
+    try {
+      for (const a of (origList?.() ?? [])) for (const t of toolViewFor(a)) known.add(t.name)
+    } catch { /* fail-open */ }
+    try {
+      const presetView = await presetToolView()
+      if (presetView) for (const t of presetView) known.add(t.name)
+    } catch { /* fail-open */ }
+    return known
+  }
+
+  // ── V2-2：失败分类（暂时 / 永久）──────────────────────────────────
+  // 永久失败 = 该名字在 agent 的已知工具集里不存在（改名/下线/换 preset 后不可恢复）
+  //   或连续失败达阈值（不在可禁继承面内，restrict 永远抛错）→ 不再重试，提示用户。
+  // 暂时失败 = 工具存在但本次挂载失败（MCP 尚未连接等）→ 按原有退避重试。
+  type ToolFailure = { name: string; kind: 'temporary' | 'permanent'; reason: string; fails: number }
+  /** 失败记录按会话隔离（V2-2 修复：此前全局单表 + 空集清理 → 任一无禁用的活会话每 2s 清空所有人的失败记录） */
+  const toolFailures = new Map<string, Map<string, ToolFailure>>()
+  const FAIL_PERMANENT_AFTER = 3
+  const classifyFailure = (sid: string, name: string, known: Set<string>, error: unknown): ToolFailure => {
+    const perSession = toolFailures.get(sid) ?? new Map<string, ToolFailure>()
+    if (!toolFailures.has(sid)) toolFailures.set(sid, perSession)
+    const prev = perSession.get(name)
+    const fails = (prev?.fails ?? 0) + 1
+    const reason = String((error as any)?.message ?? error ?? 'unknown').slice(0, 160)
+    // 名字不在该会话已知工具集 → 永久（白名单也会在入口剥掉它）
+    const kind: 'temporary' | 'permanent' = (!known.has(name) || fails >= FAIL_PERMANENT_AFTER) ? 'permanent' : 'temporary'
+    const failure: ToolFailure = { name, kind, reason, fails }
+    perSession.set(name, failure)
+    return failure
+  }
+  /** 清理该会话已不再被禁用的失败记录（只动本会话） */
+  const pruneFailures = (sid: string, activeNames: Set<string>): void => {
+    const perSession = toolFailures.get(sid)
+    if (!perSession) return
+    for (const key of [...perSession.keys()]) if (!activeNames.has(key)) perSession.delete(key)
+    if (perSession.size === 0) toolFailures.delete(sid)
+  }
+
+  type EnforceResult = { attempted: number; okTools: number; partial: boolean; failures: ToolFailure[] }
 
   /** 对单个 agent 挂 enforcement：先拆旧再挂新，返回精确成败（调用方决定记录策略）。
    *  Skill 侧已收敛为 snapshot patch 单通道（0.5.5 移除 stub 层）——enforce 只管工具 restrict。 */
@@ -327,18 +623,21 @@ export function apply(ctx: AppContext, config: Config): void {
     detach(sid)
     const want = effective(sid)
     if (want.deniedTools.length === 0) {
-      return { attempted: 0, okTools: 0, partial: false }
+      pruneFailures(sid, new Set())
+      return { attempted: 0, okTools: 0, partial: false, failures: [] }
     }
-    const result: EnforceResult = { attempted: want.deniedTools.length, okTools: 0, partial: false }
+    const result: EnforceResult = { attempted: want.deniedTools.length, okTools: 0, partial: false, failures: [] }
     const disposers: Array<() => void> = []
-    // 工具 deny：schemas() 视图过滤（未知名在 0.2.2-rc.5 会 throw——先滤掉当前不存在的，
-    // 其余 batch restrict，batch throw 再逐名降级。入口白名单（/set）已剥幽灵名，
-    // 这里剩余的 partial（如 MCP 瞬时不可用）通过标记让 sweep 按 30s 退避重试）
-    let denyList = want.deniedTools
-    try {
-      const existing = new Set<string>(ctx.tools.schemas().map((t) => t.name))
-      denyList = want.deniedTools.filter((n) => existing.has(n))
-    } catch { /* schemas 不可用时退回直传 */ }
+    // 工具 deny：按 **agent 作用域视图** 过滤（V2-3：全局视图看不到 preset 层工具，
+    // 会把 pwsh/read/grep 等真实内置工具误当幽灵丢掉）。
+    // 未知名在 0.2.2-rc.5 会 throw——先滤掉当前不存在的，其余 batch restrict，
+    // batch throw 再逐名降级。剩余失败按 V2-2 分类：永久失败不再重试。
+    const known = new Set<string>(toolViewFor(agent).map((t) => t.name))
+    const denyList = want.deniedTools.filter((n) => known.has(n))
+    // 不在已知集合里的名字 = 永久失败（该会话没有这个工具）
+    for (const n of want.deniedTools) {
+      if (!known.has(n)) result.failures.push(classifyFailure(sid, n, known, 'not present in this session tool set'))
+    }
     let toolsOk = false
     try {
       const d = agent.ctx.tools.restrict({ deny: denyList })
@@ -353,11 +652,20 @@ export function apply(ctx: AppContext, config: Config): void {
           toolsOk = true
         } catch (e) {
           trace(`restrict name ${n} threw for ${sid}: ${e}`)
+          // V2-2：分类——名字不在已知集合 = 永久；否则连续失败达阈值 = 永久（不可禁面）
+          result.failures.push(classifyFailure(sid, n, known, e))
         }
       }
     }
     result.okTools = toolsOk ? denyList.length : 0
-    result.partial = result.okTools < want.deniedTools.length
+    // V2-2：partial 只统计**暂时**失败（永久失败不再重试，不制造风暴）
+    const temporary = result.failures.filter((f) => f.kind === 'temporary')
+    result.partial = temporary.length > 0
+    // 成功项清除历史失败记录（仅本会话）
+    const perSessionFailures = toolFailures.get(sid)
+    if (perSessionFailures) {
+      for (const n of denyList) if (!result.failures.some((f) => f.name === n)) perSessionFailures.delete(n)
+    }
     if (disposers.length > 0 || result.partial) {
       // 只在有成功挂载或有失败待重试时记录；partial 标记让 sweep 永不短路（但降频，见 ensureApplied）
       const failCount = result.partial ? ((prevRecord?.failCount ?? 0) + 1) : 0
@@ -365,7 +673,7 @@ export function apply(ctx: AppContext, config: Config): void {
     } else {
       applied.delete(sid)
     }
-    trace(`enforce(${sid}) tools=${result.okTools}/${result.attempted}${result.partial ? ' PARTIAL(will-retry)' : ''}`)
+    trace(`enforce(${sid}) tools=${result.okTools}/${result.attempted}${result.partial ? ' PARTIAL(will-retry)' : ''}${result.failures.length ? ` failures=${result.failures.map((f) => `${f.name}:${f.kind}`).join(',')}` : ''}`)
     return result
   }
 
@@ -430,14 +738,14 @@ export function apply(ctx: AppContext, config: Config): void {
       origList = agentsSvc.list.bind(agentsSvc)
       agentsSvc.get = (id: string): Agent | undefined => {
         const a = origGet!(id)
-        if (a) ensureApplied(a, id)
+        if (a) { ensureSessionSkillProvider(a); ensureApplied(a, id) }
         return a
       }
       agentsSvc.list = (): Agent[] => {
         const all = origList!()
         for (const a of all) {
           const sid = normSid(String((a as any).id ?? ''))
-          if (sid) ensureApplied(a, sid)
+          if (sid) { ensureSessionSkillProvider(a); ensureApplied(a, sid) }
         }
         return all
       }
@@ -551,8 +859,10 @@ export function apply(ctx: AppContext, config: Config): void {
             const wd = (ctx as any).workingDirectory as WorkingDirectoryService | undefined
             cwd = wd?.get?.(rawSessionId) ?? wd?.get?.(sessionId) ?? cwd
           } catch { /* 传字符串参数会 throw（0.2.2-rc.5 期望 Session 对象），落到进程 cwd */ }
-          // 工具清单：mcp__server__tool 分组；其余 builtin（V1 不管控，仅展示）
-          const tools = ctx.tools.schemas().map((t) => {
+          // 工具清单：mcp__server__tool 分组；其余 builtin（V2-3：agent 作用域视图，
+          // 含 preset 层工具 pwsh/read/grep/web_search 等 → 内置工具现可管控）
+          const liveAgent = findAgent(rawSessionId)
+          const tools = toolViewFor(liveAgent).map((t) => {
             const m = MCP_RE.exec(t.name)
             return m
               ? { name: t.name, kind: 'mcp' as const, server: m[1], tool: m[2], description: t.description ?? '' }
@@ -581,16 +891,34 @@ export function apply(ctx: AppContext, config: Config): void {
           // 0.5.5 修复 L5：applied 只序列化诊断字段（disposers 是函数，JSON 后恒 null 无信息量）
           const ap = sessionId ? (applied.get(sessionId) ?? null) : null
           const appliedSummary = ap ? { key: ap.key, partial: ap.partial, failCount: ap.failCount, lastFailAt: ap.lastFailAt } : null
+          // V2-2：失败分类（永久失败 = 该会话工具集里没有 / 不可禁；暂时失败 = 稍后重试）
+          const relevantNames = new Set<string>(effective(sessionId).deniedTools)
+          const perSessionFailures = sessionId ? (toolFailures.get(sessionId) ?? new Map<string, ToolFailure>()) : new Map<string, ToolFailure>()
+          const failures = [...perSessionFailures.values()]
+            .filter((f) => relevantNames.has(f.name) || f.kind === 'permanent')
+            .map((f) => ({ name: f.name, kind: f.kind, reason: f.reason, fails: f.fails }))
+          // V2-3 修复（rv2-ui 发现的中危）：被禁工具因 restrict 从清单消失 → 面板看不到 →
+          //   下次「批量应用」的全量回写把它静默丢弃（用户无法看到/恢复已禁用项）。
+          //   ⇒ /state 补回「已禁用但当前视图不可见」的条目（hidden 标记），UI 照常显示为已禁用。
+          const toolNames = new Set(tools.map((t) => t.name))
+          const effTools = effective(sessionId)
+          for (const deniedName of effTools.deniedTools) {
+            if (toolNames.has(deniedName)) continue
+            tools.push({ name: deniedName, kind: deniedName.startsWith('mcp__') ? 'mcp' : 'builtin', server: deniedName.startsWith('mcp__') ? (MCP_RE.exec(deniedName)?.[1] ?? '') : '', tool: deniedName.startsWith('mcp__') ? (MCP_RE.exec(deniedName)?.[2] ?? deniedName) : deniedName, description: '已禁用（当前工具集中不可见）' })
+          }
+          tools.sort((a, b) => (a.server === b.server ? a.name.localeCompare(b.name) : a.server.localeCompare(b.server)))
+          const mcpServers2 = [...new Set(tools.filter((t) => t.kind === 'mcp').map((t) => t.server!))]
           return json(res, 200, {
             sessionId,
             cwd,
             tools,
             skills,
             skillsComplete,
-            mcpServers,
+            mcpServers: mcpServers2,
             global: store.global,
             session,
             applied: appliedSummary,
+            failures,
             // 0.5.5 修复 M-3：findAgent 兼容 registry 实际键 session-<uuid>（裸 uuid 不再恒 false）
             agentLive: sessionId ? !!findAgent(rawSessionId) : false,
             sessionsIndex: Object.fromEntries(
@@ -619,13 +947,18 @@ export function apply(ctx: AppContext, config: Config): void {
             if (!SID_RE.test(sessionId)) return json(res, 400, { error: 'invalid sessionId (chars limited to [A-Za-z0-9._-], must not start with -)' })
           }
           // 0.5.5 修复 M1：字段可选语义——缺省 = 保持该字段现值（tools-only 调用方不再抹掉 skills 禁用）
+          // V2-1：新增 released* 字段（session scope = 本会话放行；global scope = 全局默认放行）
           const hasT = Array.isArray(body.deniedTools)
           const hasS = Array.isArray(body.deniedSkills)
+          const hasRT = Array.isArray(body.releasedTools)
+          const hasRS = Array.isArray(body.releasedSkills)
           const current = scope === 'global'
             ? store.global
-            : (sessionId && Object.prototype.hasOwnProperty.call(store.sessions, sessionId) ? store.sessions[sessionId] : { deniedTools: [], deniedSkills: [] })
+            : (sessionId && Object.prototype.hasOwnProperty.call(store.sessions, sessionId) ? store.sessions[sessionId] : { deniedTools: [], deniedSkills: [], releasedTools: [], releasedSkills: [] })
           const nextTools = hasT ? normalizeSet(body.deniedTools) : [...current.deniedTools]
           const nextSkills = hasS ? normalizeSet(body.deniedSkills) : [...current.deniedSkills]
+          const nextRelTools = hasRT ? normalizeSet(body.releasedTools) : [...(current.releasedTools ?? [])]
+          const nextRelSkills = hasRS ? normalizeSet(body.releasedSkills) : [...(current.releasedSkills ?? [])]
           if (hasS && nextSkills.length > 0) {
             // 0.5.3 修复 N1（0.5.2 回归）：白名单必须与 /state 展示清单同源
             // （snapshot + scanSkillDirs 合并）——两清单都为空时 fail-open 不过滤（可用性优先）。
@@ -640,20 +973,26 @@ export function apply(ctx: AppContext, config: Config): void {
           if (hasT && nextTools.length > 0) {
             // 0.5.5 修复 H5/M2：tools 侧同源白名单（与 /state tools 清单一致）——
             // 变体名/幽灵名在入口剥除，「禁不掉却显示已禁用」与 partial 重试风暴不再产生。
-            // 行为变更：deny-what-you-see（未连接 server 的工具先出现在面板再禁）。
-            const knownTools = new Set<string>()
-            try { for (const t of ctx.tools.schemas()) knownTools.add(t.name) } catch { /* fail-open */ }
+            // V2-3：白名单 = 全局视图 ∪ 目标会话 agent 视图 ∪ **所有活会话的 agent 视图**
+            //   （否则非活会话/global scope 下 pwsh/read/grep 会被当幽灵剥掉 → 内置工具无法管控；
+            //    rv2-api P0-2 根因）。
+            const knownTools = await knownToolNames(sessionId)
             if (knownTools.size > 0) {
               for (const n of nextTools) if (!knownTools.has(n)) trace(`ghost tool name stripped at entry: ${n}`)
               patchFilter(nextTools, knownTools)
             }
           }
-          const written: DenialSet = { deniedTools: nextTools, deniedSkills: nextSkills }
+          const written: DenialSet = {
+            deniedTools: nextTools,
+            deniedSkills: nextSkills,
+            releasedTools: nextRelTools,
+            releasedSkills: nextRelSkills,
+          }
           if (scope === 'global') {
-            store.global = { deniedTools: nextTools, deniedSkills: nextSkills }
+            store.global = written
           } else {
             // 空 delta = 回归继承 → 删除会话条目
-            if (nextTools.length === 0 && nextSkills.length === 0) delete store.sessions[sessionId]
+            if (nextTools.length === 0 && nextSkills.length === 0 && nextRelTools.length === 0 && nextRelSkills.length === 0) delete store.sessions[sessionId]
             else store.sessions[sessionId] = written
           }
           persist()
@@ -692,48 +1031,174 @@ export function apply(ctx: AppContext, config: Config): void {
     },
   }), `${SHORT}: api`)
 
-  // ── hook skills.snapshot：per-session 过滤被禁 skill ──────────────
-  // 实测生效机制（0.2.2-rc.5）：agent-loop 把 agent 实例本身当 scope 传入，且 agent 携带 id
-  // 字符串 → options.scope.id 命中。注意：这是未文档化实现巧合（ScopeKey 类型是 object），
-  // DSH 升级后须回归验证「skill 禁用是否仍按会话过滤」。守卫防双实例重复包装（0.5.1）。
-  try {
-    const skillsAny = ctx.skills as any
-    if (skillsAny.__gate_snapshot_patched !== true) {
-      skillsAny.__gate_snapshot_patched = true
-      const origSnapshot = skillsAny.snapshot.bind(skillsAny)
-      skillsAny.snapshot = async (options: any) => {
-        const result = await origSnapshot(options)
-        try {
-          const rawSid = String(options?.scope?.id ?? options?.scope?.session?.id ?? '')
-          const sid = normSid(rawSid)
-          if (!sid) return result
-          const denied = effective(sid) // 0.5.1：包 try——畸形 store 不再打断宿主技能目录组装（fail-open）
-          if (denied.deniedSkills.length === 0) return result
-          const filtered = {
-            ...result,
-            skills: result.skills.filter((s: any) => !denied.deniedSkills.includes(s.name)),
-          }
-          trace(`snapshot filtered for ${sid}: ${result.skills.length} -> ${filtered.skills.length}`)
-          return filtered
-        } catch (e) {
-          trace(`snapshot filter failed (fail-open): ${e}`)
-          return result
-        }
-      }
-      ctx.effect(() => {
-        trace('skills.snapshot patched for per-session filtering')
-        return (): void => {
-          try { skillsAny.snapshot = origSnapshot } catch { /* ignore */ }
-          try { delete skillsAny.__gate_snapshot_patched } catch { /* ignore */ }
-          trace('skills.snapshot restored')
-        }
-      }, 'dsh-skillmcp-gate: snapshot patch')
-    } else {
-      trace('skills.snapshot already patched by another instance — skip (guard)')
+  // ── V2-1：skill 管控迁移官方 SkillProvider seam ────────────────────
+  // 官方 seam（dsh-skill 0.2.2-rc.5 已验证）：
+  //   ① ctx.skills.registerProvider(create) → provider 落进「调用方 ctx 的 scope 层」
+  //      （宿主文档：unscoped ctx → 全局层；带 scope 的 ctx → 该 scope 层）
+  //   ② 候选按 name 合并：同层内 rank 小者胜（compareIndexedCandidates），
+  //      跨层则「近作用域覆盖远作用域」（collectFresh：merged.set(name, entry)）
+  //   ③ 模型侧技能目录 = snapshot.skills.filter(isModelInvocable)（dsh-tool-skill L226-229），
+  //      skill 工具加载路径同样拒绝非 model-invocable（dsh-tool-skill L142-150）
+  //   → 方案：用 rank=50 的 shadow 候选（同 name、modelInvocable=false）压过所有来源
+  //     （project-dsh 100 / project-agents 200 / custom 300 / user-dsh 400 /
+  //       user-agents 500 / bundled 600），模型既看不到该 skill，工具也拒绝加载。
+  //   → 比 0.5.x 的 snapshot monkey-patch 更强：旧实现只在目录层过滤，
+  //     模型若直接点名仍能用 skill 工具加载被禁 skill。
+  // 旧宿主（无 registerProvider）退回 0.5.x 的 snapshot patch 兜底。
+  const SKILL_GATE_PROVIDER = 'dsh-skillmcp-gate'
+  const SKILL_GATE_PROVIDER_SESSION = 'dsh-skillmcp-gate-session'
+  const SKILL_GATE_RANK = 50
+  /** 宿主 skill 名文法（dsh-skill SKILL_NAME）：非法名不得进入 provider，否则整个 list() 校验失败 */
+  const SKILL_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+  const DISABLED_SKILL_DESC = '[disabled] 该 Skill 已被用户禁用（dsh-skillmcp-gate）'
+  const disabledSkillContent = (name: string): string =>
+    `# ${name}（disabled）\n\n该 Skill 已被用户禁用（dsh-skillmcp-gate）。不要尝试使用它；如任务需要该能力，请如实告知用户。`
+
+  /** 禁用集合变更后让 registry 的目录缓存失效（否则模型侧仍看到旧目录） */
+  let invalidateSkillCatalog: (() => void) | null = null
+  /** 已挂载会话作用域 provider 的会话键 */
+  const sessionSkillProviders = new Set<string>()
+
+  const shadowCandidate = (name: string): Record<string, unknown> => ({
+    name,
+    description: DISABLED_SKILL_DESC,
+    invocation: { modelInvocable: false, userInvocable: false },
+    source: 'custom',
+    provider: SKILL_GATE_PROVIDER,
+    rank: SKILL_GATE_RANK,
+    locator: { name },
+  })
+  const shadowDefinition = (candidate: any): Record<string, unknown> => ({
+    name: candidate.name,
+    description: candidate.description ?? DISABLED_SKILL_DESC,
+    invocation: candidate.invocation ?? { modelInvocable: false, userInvocable: false },
+    source: candidate.source ?? 'custom',
+    provider: candidate.provider ?? SKILL_GATE_PROVIDER,
+    content: disabledSkillContent(String(candidate.name)),
+  })
+  /** 依据禁用集合产出 shadow 候选（非法名跳过，保证 provider 永不让整个目录失败） */
+  const shadowCandidatesFor = (names: readonly string[]): Array<Record<string, unknown>> => {
+    const out: Array<Record<string, unknown>> = []
+    for (const name of new Set(names)) {
+      if (!SKILL_NAME_RE.test(name)) continue
+      out.push(shadowCandidate(name))
     }
-  } catch (e) {
-    trace(`skills snapshot patch failed: ${e}`)
+    return out
   }
 
-  ctx.logger?.info?.(`[${SHORT}] ready — store=${storeFile}${loaded.corrupted ? ' (PREVIOUS FILE QUARANTINED)' : ''}`)
+  const skillsAny = ctx.skills as any
+  const providerCapable = typeof skillsAny?.registerProvider === 'function'
+
+  if (providerCapable) {
+    // 全局层 provider：承载 global 默认禁用（全局层参与每条 scope 链 → 全局禁用处处生效）
+    ctx.effect(() => {
+      let control: any = null
+      const dispose = skillsAny.registerProvider((c: any) => {
+        control = c
+        return {
+          name: SKILL_GATE_PROVIDER,
+          list: async (): Promise<Array<Record<string, unknown>>> =>
+            shadowCandidatesFor(store.global.deniedSkills),
+          get: async (candidate: any): Promise<Record<string, unknown>> => shadowDefinition(candidate),
+        }
+      })
+      invalidateSkillCatalog = (): void => {
+        try { control?.invalidate?.() } catch { /* ignore */ }
+      }
+      trace(`skill gate provider registered (official seam, rank=${SKILL_GATE_RANK})`)
+      return (): void => {
+        invalidateSkillCatalog = null
+        try { dispose() } catch { /* ignore */ }
+        trace('skill gate provider unregistered')
+      }
+    }, 'dsh-skillmcp-gate: skill provider')  } else {
+    // ── 兜底：旧宿主无 registerProvider → 保留 0.5.x 的 snapshot monkey-patch ──
+    // 实测生效机制（0.2.2-rc.5）：agent-loop 把 agent 实例本身当 scope 传入，且 agent 携带 id
+    // 字符串 → options.scope.id 命中。注意：这是未文档化实现巧合（ScopeKey 类型是 object），
+    // DSH 升级后须回归验证「skill 禁用是否仍按会话过滤」。守卫防双实例重复包装（0.5.1）。
+    trace('skills.registerProvider unavailable — falling back to snapshot patch')
+    try {
+      if (skillsAny.__gate_snapshot_patched !== true) {
+        skillsAny.__gate_snapshot_patched = true
+        const origSnapshot = skillsAny.snapshot.bind(skillsAny)
+        skillsAny.snapshot = async (options: any) => {
+          const result = await origSnapshot(options)
+          try {
+            const rawSid = String(options?.scope?.id ?? options?.scope?.session?.id ?? '')
+            const sid = normSid(rawSid)
+            if (!sid) return result
+            const denied = effective(sid) // 0.5.1：包 try——畸形 store 不再打断宿主技能目录组装（fail-open）
+            if (denied.deniedSkills.length === 0) return result
+            const filtered = {
+              ...result,
+              skills: result.skills.filter((s: any) => !denied.deniedSkills.includes(s.name)),
+            }
+            trace(`snapshot filtered for ${sid}: ${result.skills.length} -> ${filtered.skills.length}`)
+            return filtered
+          } catch (e) {
+            trace(`snapshot filter failed (fail-open): ${e}`)
+            return result
+          }
+        }
+        ctx.effect(() => {
+          trace('skills.snapshot patched for per-session filtering (legacy fallback)')
+          return (): void => {
+            try { skillsAny.snapshot = origSnapshot } catch { /* ignore */ }
+            try { delete skillsAny.__gate_snapshot_patched } catch { /* ignore */ }
+            trace('skills.snapshot restored')
+          }
+        }, 'dsh-skillmcp-gate: snapshot patch')
+      } else {
+        trace('skills.snapshot already patched by another instance — skip (guard)')
+      }
+    } catch (e) {
+      trace(`skills snapshot patch failed: ${e}`)
+    }
+  }
+
+  /** 会话作用域 provider：让「会话级 skill 禁用」成为可能（官方 seam 的层覆盖语义）。
+   *  agent.ctx 即 agent 的作用域 ctx（宿主：calling through agent.ctx scopes EFFECTS），
+   *  在其上注入 skills 服务后注册 provider → 落进该 agent 的 scope 层，
+   *  读取时近作用域覆盖全局层 → 仅该会话生效。 */
+  const ensureSessionSkillProvider = (agent: Agent): void => {
+    if (!providerCapable) return
+    const sid = normSid(String((agent as any).id ?? (agent as any).sessionId ?? ''))
+    if (!sid || sessionSkillProviders.has(sid)) return
+    const agentCtx = (agent as any).ctx
+    if (!agentCtx || typeof agentCtx.inject !== 'function') return
+    try {
+      const disposeInject = agentCtx.inject(['skills'], (scoped: any) => {
+        const dispose = scoped.skills.registerProvider((c: any) => {
+          return {
+            name: SKILL_GATE_PROVIDER_SESSION,
+            list: async (): Promise<Array<Record<string, unknown>>> => {
+              // 会话层 = 该会话「额外禁用」的技能（含全局禁用项；会话 released 已从 effective 中抵消）
+              const eff = effective(sid)
+              return shadowCandidatesFor(eff.deniedSkills)
+            },
+            get: async (candidate: any): Promise<Record<string, unknown>> => shadowDefinition(candidate),
+          }
+        })
+        sessionSkillProviders.add(sid)
+        trace(`session skill provider mounted for ${sid}`)
+        return (): void => {
+          try { dispose() } catch { /* ignore */ }
+          sessionSkillProviders.delete(sid)
+          trace(`session skill provider unmounted for ${sid}`)
+        }
+      })
+      if (typeof disposeInject === 'function') {
+        ctx.effect(() => {
+          return (): void => {
+            try { disposeInject() } catch { /* ignore */ }
+            sessionSkillProviders.delete(sid)
+          }
+        }, 'dsh-skillmcp-gate: session skill provider')
+      }
+    } catch (e) {
+      trace(`session skill provider failed for ${sid}: ${e}`)
+    }
+  }
+
+  ctx.logger?.info?.(`[${SHORT}] ready — store=${storeFile}${loaded.corrupted ? ' (PREVIOUS FILE QUARANTINED)' : ''}${providerCapable ? ' (skill gate: official provider seam)' : ' (skill gate: legacy snapshot fallback)'}`)
 }
