@@ -100,29 +100,42 @@ function draftStorageKey(sessionId: string | undefined, globalMode: boolean): st
   return `skillmcp-gate:draft:${globalMode ? 'global' : (sessionId || 'nosession')}`
 }
 
-/** 草稿模型：t/s = 禁用集合；rt/rs = 放行集合（V2-1 继承+覆写） */
-type DraftModel = { t: Set<string>; s: Set<string>; rt: Set<string>; rs: Set<string> }
+/** 草稿模型：t/s = 禁用集合；rt/rs = 放行集合（V2-1 继承+覆写）；
+ *  base = 草稿**创建时**的生效基准快照（0.6.5 修复 E5.3/E5.4：diff 必须相对草稿出生基准算，
+ *  不能相对"当前 applied"——全局变化/轮询刷新会让 applied 漂移，把用户没动的项误判成新禁用） */
+type DraftModel = {
+  t: Set<string>; s: Set<string>; rt: Set<string>; rs: Set<string>
+  /** 必填：漏传会让 diff 退化成全量回写（0.6.5 实测 G1——编译器不再放过） */
+  base: { t: string[]; s: string[] }
+}
 
 function loadDraft(key: string): DraftModel | null {
   try {
     const raw = window.sessionStorage.getItem(key)
     if (!raw) return null
-    const parsed = JSON.parse(raw) as { t?: unknown; s?: unknown; rt?: unknown; rs?: unknown }
+    const parsed = JSON.parse(raw) as { t?: unknown; s?: unknown; rt?: unknown; rs?: unknown; base?: unknown }
     if (!parsed || typeof parsed !== 'object') return null
     const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
+    const b = parsed.base as { t?: unknown; s?: unknown } | undefined
     return {
       t: new Set(strs(parsed.t)),
       s: new Set(strs(parsed.s)),
       rt: new Set(strs(parsed.rt)),
       rs: new Set(strs(parsed.rs)),
+      // 旧格式草稿（0.6.4 及以前）无 base：兜底为空基准 = 把草稿全部视为"用户新加"，与旧行为一致
+      base: b && typeof b === 'object' ? { t: strs(b.t), s: strs(b.s) } : { t: [], s: [] },
     }
   } catch { return null }
 }
 
 function saveDraft(key: string, draft: DraftModel | null): void {
   try {
-    if (draft) window.sessionStorage.setItem(key, JSON.stringify({ t: [...draft.t], s: [...draft.s], rt: [...draft.rt], rs: [...draft.rs] }))
-    else window.sessionStorage.removeItem(key)
+    if (draft) {
+      window.sessionStorage.setItem(key, JSON.stringify({
+        t: [...draft.t], s: [...draft.s], rt: [...draft.rt], rs: [...draft.rs],
+        ...(draft.base ? { base: draft.base } : {}),
+      }))
+    } else window.sessionStorage.removeItem(key)
   } catch { /* 存储不可用（隐私模式）时草稿仅内存态 */ }
 }
 
@@ -135,6 +148,24 @@ function setEquals(a: Set<string>, b: Set<string>): boolean {
   if (a.size !== b.size) return false
   for (const v of a) if (!b.has(v)) return false
   return true
+}
+
+/** 已生效基准（global ∪ session.denied − released）。纯函数：渲染与 applyDraft 共用同一口径，
+ *  applyDraft 按 stRef.current 现算，避免闭包捕获过期基准（0.6.4 修复「陈旧面板全量回写」）。 */
+function appliedBaseline(st: State, globalMode: boolean): { appliedT: Set<string>; appliedS: Set<string>; relT: Set<string>; relS: Set<string> } {
+  const appliedT = new Set(st.global.deniedTools)
+  const appliedS = new Set(st.global.deniedSkills)
+  const relT = new Set(st.global.releasedTools ?? [])
+  const relS = new Set(st.global.releasedSkills ?? [])
+  if (!globalMode && st.session) {
+    for (const x of st.session.deniedTools) appliedT.add(x)
+    for (const x of st.session.deniedSkills) appliedS.add(x)
+    for (const x of st.session.releasedTools ?? []) relT.add(x)
+    for (const x of st.session.releasedSkills ?? []) relS.add(x)
+  }
+  for (const x of relT) appliedT.delete(x)
+  for (const x of relS) appliedS.delete(x)
+  return { appliedT, appliedS, relT, relS }
 }
 
 // ── React 面板 ──────────────────────────────────────────────────────
@@ -190,10 +221,59 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
       // 0.5.1 的「load 成功清草稿」会把 applyDraft 完成后保留的增量勾选一并吞掉。
       // 草稿保留后横条 diff 基于“新 applied vs draft”计算，语义仍自洽；
       // 跨会话的草稿清理移至 sessionId 变化的 useEffect（见下）。
+      // 0.6.6 修复（E2E 五审 E5.3/E5.4 真根因）：**rebase 草稿到新基准**——
+      //   此前只刷新 st、不校正草稿：草稿里"用户没动过、但基准已变"的项（如全局已解禁的 office）
+      //   仍以旧态留在草稿里 → 面板显示删除线、横条多计、提交时被当成用户禁用而固化。
+      //   现语义：草稿只保留"相对出生基准的增量"；基准变了的项从草稿里剔除，并把出生基准推进到最新。
+      setDraft((cur) => {
+        if (!cur) return cur
+        const { appliedT: nT, appliedS: nS, relT: nR, relS: nRS } = appliedBaseline(next, globalMode)
+        const bT = new Set(cur.base?.t ?? [])
+        const bS = new Set(cur.base?.s ?? [])
+        const keep = (draftSet: Set<string>, birth: Set<string>, now: Set<string>): Set<string> => {
+          const out = new Set<string>()
+          for (const n of draftSet) {
+            // 草稿项 = "用户想要的最终禁用集"。按来源分三类：
+            // ① 用户在出生基准上**新加**的（基准无、草稿有）→ 永远保留（用户意图）
+            // ② 从出生基准**继承**的（基准有、草稿有 = 用户没动）→ 只在基准仍含它时保留；
+            //    基准已不含（如全局解禁）→ 丢弃，让面板回到真实状态（E5.3 根因）
+            // ③ 基准无、但现在有（别人刚禁的）→ 草稿里若也有，视作用户新加 → 保留
+            if (!birth.has(n)) out.add(n)
+            else if (now.has(n)) out.add(n)
+          }
+          return out
+        }
+        // 对"出生基准里有、用户取消勾选（放行）"的项：基准若已不含它 → 用户意图已由全局满足，从放行集剔除
+        // rebase 后的草稿 = 用户意图 ∪ 当前基准（0.6.7 修复 E2E 新缺陷②「rebase 后面板不反映基准新增禁用」）：
+        //   此前只剔除「基准已不含」的项，不补「基准新增」的项 → 全局刚禁的 apple-design 不在草稿里，
+        //   而草稿存在时面板只渲染 draft → 该项 18s 内仍显示勾选，与真实状态不符。
+        //   现语义：先剔除"继承自已消失基准"的项（keep），再把当前基准整体并入，
+        //   最后扣除用户显式放行的项（rt/rs），才不会把放行又变回禁用。
+        const tKeep = keep(cur.t, bT, nT)
+        const sKeep = keep(cur.s, bS, nS)
+        // 放行集 rebase（0.6.7 修复 E2E H1「会话自身放行被丢弃」）：
+        //   放行记录必须保留，否则下次 load 该项回到被禁。只剔除「global 已不再禁用」的放行
+        //   （全局解禁 = 意图已由全局满足）。不能用"当前生效禁用集 nS"判——会话放行后 nS 已不含该项，
+        //   会把放行记录误删（H1 根因）。
+        const gDeniedT = new Set(next.global.deniedTools)
+        const gDeniedS = new Set(next.global.deniedSkills)
+        const rt = new Set([...cur.rt].filter((n) => gDeniedT.has(n)))
+        const rs = new Set([...cur.rs].filter((n) => gDeniedS.has(n)))
+        const t = new Set([...tKeep, ...nT])
+        const s = new Set([...sKeep, ...nS])
+        for (const n of rt) t.delete(n)
+        for (const n of rs) s.delete(n)
+        // 用户显式"移除"的项（出生基准有、草稿里被取消勾选）不得被并入的基准加回——
+        //   否则解除会话级禁用后，下一次轮询又把它显示成禁用（用户意图丢失）。
+        //   removed = 出生基准有 ∧ 草稿无（= 用户取消了它）∧ 当前基准仍有（= 需要显式表达移除）
+        for (const n of bT) if (!cur.t.has(n) && !tKeep.has(n)) t.delete(n)
+        for (const n of bS) if (!cur.s.has(n) && !sKeep.has(n)) s.delete(n)
+        return { t, s, rt, rs, base: { t: [...nT].sort(), s: [...nS].sort() } }
+      })
     } catch (e: any) {
       setErr(String(e?.message ?? e))
     }
-  }, [sessionId])
+  }, [sessionId, globalMode])
 
   const prevSidRef = useRef<string | undefined>(undefined)
   useEffect(() => {
@@ -204,6 +284,14 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
     void load()
   }, [load, sessionId])
   reloadRef.current = () => { void load() }
+  // 0.6.4 修复（E2E 四审 E1/E4/E5/D1.6「面板陈旧」）：面板打开期间全局/会话状态可能被
+  //   设置页或 API 改动——面板不刷新会显示过期状态，且在其上「批量应用」会把过期状态写回
+  //   （实测：把已解禁的 skill 写成会话禁用）。定期拉新服务端状态：无草稿时直接刷新；
+  //   有草稿时保留用户勾选，只刷新 applied 基准（diff/计数据此重算）。
+  useEffect(() => {
+    const timer = window.setInterval(() => { void load() }, 5000)
+    return () => { window.clearInterval(timer) }
+  }, [load])
 
   const applyDraft = useCallback(async (): Promise<void> => {
     if (!draft || applying) return // 0.5.1：in-flight 锁
@@ -223,15 +311,30 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
       } else {
         // V2-1：会话 scope = 继承 + 覆写——denied* 是本会话禁用，released* 是本会话放行
         // （放行一个全局默认禁用的 skill）。服务端 effective() 计算 (global ∪ session.denied) − released。
-        // V2-3 修复（rv2-ui 中危）：服务端已有但当前视图不可见的禁用项必须保留——
-        //   否则「批量应用」的全量回写会静默丢弃它们（被禁工具因 restrict 不在清单里）。
+        // 0.6.4 修复（E2E 四审缺陷①「全量回写固化」）：会话 delta 只提交**相对基准的 diff**。
+        // 0.6.5 修复（E2E 五审 E5.3/E5.4）：diff 基准改用 **draft.base（草稿出生时的快照）**——
+        //   此前用"当前 applied"：草稿存在期间全局解禁了 office，轮询刷新了 applied，
+        //   但草稿里 office 仍是未勾选 → 被误判成"用户新禁用"→ 固化成会话禁用（E5.3）；
+        //   轮询与点击竞态时同样误判（E5.4 ~10% 复现）。
+        //   现语义：用户改动 = draft 相对**出生基准**的增量；出生基准里没有、draft 里也没勾的项 = 不是用户改的。
         const currentSession = stRef.current?.session
-        const serverDeniedTools = new Set(currentSession?.deniedTools ?? [])
-        const keepTools = [...snapshot.t]
-        for (const n of serverDeniedTools) if (!keepTools.includes(n)) keepTools.push(n)
-        const serverDeniedSkills = new Set(currentSession?.deniedSkills ?? [])
-        const keepSkills = [...snapshot.s]
-        for (const n of serverDeniedSkills) if (!keepSkills.includes(n)) keepSkills.push(n)
+        const visibleNames = new Set((stRef.current?.tools ?? []).map((t) => t.name))
+        const visibleSkillNames = new Set((stRef.current?.skills ?? []).map((s) => s.name))
+        const birthT = new Set(draft.base?.t ?? [])
+        const birthS = new Set(draft.base?.s ?? [])
+        const sessDeniedTools = new Set(currentSession?.deniedTools ?? [])
+        const sessDeniedSkills = new Set(currentSession?.deniedSkills ?? [])
+        const keepTools: string[] = []
+        const keepSkills: string[] = []
+        // 用户明确禁用的（draft 有、出生基准无）
+        for (const n of snapshot.t) if (!birthT.has(n)) keepTools.push(n)
+        for (const n of snapshot.s) if (!birthS.has(n)) keepSkills.push(n)
+        // 出生基准里已禁用、且用户没动过的 → 保留会话既有的显式禁用（不丢也不越权解禁）
+        for (const n of sessDeniedTools) if (snapshot.t.has(n) && birthT.has(n) && !keepTools.includes(n)) keepTools.push(n)
+        for (const n of sessDeniedSkills) if (snapshot.s.has(n) && birthS.has(n) && !keepSkills.includes(n)) keepSkills.push(n)
+        // 服务端既有但清单不可见的 → 原样保留（被禁工具因 restrict 不在清单里，用户无从操作）
+        for (const n of sessDeniedTools) if (!visibleNames.has(n) && !keepTools.includes(n)) keepTools.push(n)
+        for (const n of sessDeniedSkills) if (!visibleSkillNames.has(n) && !keepSkills.includes(n)) keepSkills.push(n)
         data = await apiSet({
           scope: 'session',
           sessionId,
@@ -242,6 +345,10 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
         })
       }
       await load()
+      // 0.6.1 修复（E2E 中）：restrict 的 disposer 生效有延迟（服务端实测 ~3s 才恢复工具视图）——
+      //   解除禁用后立即 load 仍读到旧视图，面板停在「行消失 + 计数不回」。
+      //   故延迟再刷一次，让面板与服务端最终状态对齐。
+      window.setTimeout(() => { void load() }, 3500)
       // 0.5.5 修复 L3：应用结果显式反馈（消费 host 0.5.5 的真实聚合——partial 提示后台重试）
       const isPartial = data?.partial === true || data?.applied?.result?.partial === true
       flashAppliedMsg(isPartial ? '⚠ 已应用：部分工具暂未生效（将自动重试）' : '✓ 已应用')
@@ -258,6 +365,8 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
       setApplying(false)
     }
   }, [draft, applying, globalMode, sessionId, load])
+  // 0.6.1：组件卸载时清理延迟刷新（防对已卸载组件 setState）
+  useEffect(() => () => { /* 延迟 load 自带 try/catch，卸载后 setSt 为 no-op */ }, [])
 
   if (err !== null && st === null) {
     // 0.5.1：错误页加重试入口（不再卡死到组件重挂）。
@@ -275,18 +384,7 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
   }
 
   // 已生效集合（global + session 合并；V2-1：含 released 抵消）
-  const appliedT = new Set(st.global.deniedTools)
-  const appliedS = new Set(st.global.deniedSkills)
-  const relT = new Set(st.global.releasedTools ?? [])
-  const relS = new Set(st.global.releasedSkills ?? [])
-  if (!globalMode && st.session) {
-    for (const x of st.session.deniedTools) appliedT.add(x)
-    for (const x of st.session.deniedSkills) appliedS.add(x)
-    for (const x of st.session.releasedTools ?? []) relT.add(x)
-    for (const x of st.session.releasedSkills ?? []) relS.add(x)
-  }
-  for (const x of relT) appliedT.delete(x)
-  for (const x of relS) appliedS.delete(x)
+  const { appliedT, appliedS, relT, relS } = appliedBaseline(st, globalMode)
   // 渲染视图：有 draft 时勾选框/删除线/计数立即反映用户选择（生效仍等「批量应用」）——0.4.4
   const deniedT = draft !== null ? draft.t : appliedT
   const deniedS = draft !== null ? draft.s : appliedS
@@ -298,6 +396,8 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
     s: new Set(appliedS),
     rt: new Set(relT),
     rs: new Set(relS),
+    // 草稿出生基准：此后 applied 可能因全局变化/轮询漂移，diff 一律相对此快照
+    base: { t: [...appliedT].sort(), s: [...appliedS].sort() },
   }
   /** 切换某项的禁用/放行状态（会话 scope 支持放行；全局 scope 只切换禁用） */
   const toggleItem = (kind: 't' | 's', name: string, denied: boolean): void => {
@@ -317,8 +417,8 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
       else nextR.delete(name)
     }
     setDraft(kind === 't'
-      ? { t: nextD, s: new Set(base.s), rt: nextR, rs: new Set(base.rs) }
-      : { t: new Set(base.t), s: nextD, rt: new Set(base.rt), rs: nextR })
+      ? { t: nextD, s: new Set(base.s), rt: nextR, rs: new Set(base.rs), base: base.base }
+      : { t: new Set(base.t), s: nextD, rt: new Set(base.rt), rs: nextR, base: base.base })
   }
 
   const setTool = (name: string, denied: boolean): void => toggleItem('t', name, denied)
@@ -330,7 +430,7 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
       if (denyAll) next.add(t.name)
       else next.delete(t.name)
     }
-    setDraft({ t: next, s: new Set(base.s), rt: new Set(base.rt), rs: new Set(base.rs) })
+    setDraft({ t: next, s: new Set(base.s), rt: new Set(base.rt), rs: new Set(base.rs), base: base.base })
   }
   // 0.5.5 修复 M7：Skill 组与 MCP server 组同款整组勾选（语义一致，恢复不再反向操作）
   const setAllSkills = (denyAll: boolean): void => {
@@ -340,7 +440,7 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
       if (denyAll) next.add(s.name)
       else next.delete(s.name)
     }
-    setDraft({ t: new Set(base.t), s: next, rt: new Set(base.rt), rs: new Set(base.rs) })
+    setDraft({ t: new Set(base.t), s: next, rt: new Set(base.rt), rs: new Set(base.rs), base: base.base })
   }
 
   // 0.5.5（r2b 建议 #8）：列表搜索过滤（仅过滤行显示；计数仍为全量口径）
@@ -432,19 +532,23 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
   const statusLine = draft !== null
     ? globalMode
       ? `应用后（全局默认）：${mcpAvailable}/${mcpTotal} MCP · ${builtinAvailable}/${builtinAll.length} 内置 · ${skillAvailable}/${st.skills.length} Skill（新会话继承）`
-      : `应用后：${mcpAvailable}/${mcpTotal} MCP（本会话）· ${builtinAvailable}/${builtinAll.length} 内置（本会话）· ${skillAvailable}/${st.skills.length} Skill（全局）${st.agentLive ? '' : ' · 下条消息唤醒时生效'}`
+      : `应用后：${mcpAvailable}/${mcpTotal} MCP（本会话）· ${builtinAvailable}/${builtinAll.length} 内置（本会话）· ${skillAvailable}/${st.skills.length} Skill（本会话）${st.agentLive ? '' : ' · 下条消息唤醒时生效'}`
     : globalMode
       ? `全局默认：${mcpAvailable}/${mcpTotal} MCP · ${builtinAvailable}/${builtinAll.length} 内置 · ${skillAvailable}/${st.skills.length} Skill（新会话继承）`
-      : `下条消息生效：${mcpAvailable}/${mcpTotal} MCP（本会话）· ${builtinAvailable}/${builtinAll.length} 内置（本会话）· ${skillAvailable}/${st.skills.length} Skill（全局）${st.agentLive ? '' : ' · 下条消息唤醒时生效'}`
+      : `下条消息生效：${mcpAvailable}/${mcpTotal} MCP（本会话）· ${builtinAvailable}/${builtinAll.length} 内置（本会话）· ${skillAvailable}/${st.skills.length} Skill（本会话）${st.agentLive ? '' : ' · 下条消息唤醒时生效'}`
 
   // 0.5.1 修复 M-4：横条 = 双向 diff 计数，零差异隐藏（存量 deny 不再计入）
   // V2-1：加入放行集合（rt/rs）的 diff
+  // 0.6.6：diff 相对 **draft.base（出生基准）** 计——与提交逻辑同口径。此前相对当前 applied：
+  //   全局变化/轮询刷新后 applied 漂移，用户没动的项被多计（实测「改 1 项显示 2 项」）。
   let diffCount = 0
   if (draft !== null) {
-    for (const n of draft.t) if (!appliedT.has(n)) diffCount += 1
-    for (const n of appliedT) if (!draft.t.has(n)) diffCount += 1
-    for (const n of draft.s) if (!appliedS.has(n)) diffCount += 1
-    for (const n of appliedS) if (!draft.s.has(n)) diffCount += 1
+    const bT = new Set(draft.base?.t ?? [])
+    const bS = new Set(draft.base?.s ?? [])
+    for (const n of draft.t) if (!bT.has(n)) diffCount += 1
+    for (const n of bT) if (!draft.t.has(n)) diffCount += 1
+    for (const n of draft.s) if (!bS.has(n)) diffCount += 1
+    for (const n of bS) if (!draft.s.has(n)) diffCount += 1
     for (const n of draft.rt) if (!relT.has(n)) diffCount += 1
     for (const n of relT) if (!draft.rt.has(n)) diffCount += 1
     for (const n of draft.rs) if (!relS.has(n)) diffCount += 1
@@ -543,7 +647,7 @@ function GatePanel(props: { sessionId?: string; globalMode?: boolean }): React.R
           marginTop: 6, padding: '4px 6px', borderRadius: 4,
           background: 'rgba(255,180,0,.15)', fontSize: 11,
         },
-      }, '⚠ Skill 开关为全局生效：影响所有会话（暂不支持单会话级管控）'),
+      }, 'Skill 开关在本会话生效；设置页的「全局默认」对所有新会话生效，本面板可单独放行全局已禁用的 Skill'),
     ),
     // 横条吸底（0.5.5 r2a 建议 #4）：列表滚动到底也可见「批量应用」
     draft !== null && diffCount > 0 && h('div', {

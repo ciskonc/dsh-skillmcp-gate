@@ -253,6 +253,9 @@ const toDenialSet = (v: unknown): DenialSet => {
 }
 
 /** 域后端：打开官方域 + 一次性迁移旧文件。返回 undefined 表示不可用（调用方回退文件后端）。 */
+/** 进程级域句柄：跨插件 fiber（热重载）复用，防止 already-open 回落 legacy 后端造成 store 分裂 */
+let processLevelDomain: any = null
+
 async function openDomainBackend(ctx: AppContext, legacyFile: string, trace: (m: string) => void): Promise<StoreBackend | undefined> {
   const facility = (ctx as any).get?.('storageDomain')
   if (!facility || typeof facility.open !== 'function') return undefined
@@ -269,7 +272,11 @@ async function openDomainBackend(ctx: AppContext, legacyFile: string, trace: (m:
         meta: { valueSchema: { parse: (v: unknown) => (v && typeof v === 'object' ? v : {}) } },
       },
     }
-    domain = await facility.open(spec)
+    // 0.6.6 修复（E2E 环境级发现「热重载 store 分裂」）：插件热重载时旧 fiber 的域仍开着
+    //   （already-open），旧实现回落 legacy 文件后端 → 两个后端各写各的（split-brain），
+    //   重启后域文件里的陈旧状态复活。→ 进程级缓存域句柄：跨 fiber 复用同一域，不再分裂。
+    domain = processLevelDomain ?? await facility.open(spec)
+    if (!processLevelDomain) processLevelDomain = domain
   } catch (e) {
     trace(`storageDomain open failed — falling back to legacy file: ${e}`)
     ctx.logger?.warn?.(`[${SHORT}] storageDomain open failed — using legacy file store: ${e}`)
@@ -317,7 +324,9 @@ async function openDomainBackend(ctx: AppContext, legacyFile: string, trace: (m:
     },
     listSessions: () => [...table.entries()].map(([k, v]) => [k, toDenialSet(v)] as [string, DenialSet]),
     persistent: true,
-    close: async () => { try { await domain.close() } catch { /* ignore */ } },
+    // 不在 fiber 卸载时关域：进程级缓存仍持有句柄，热重载的新 fiber 要复用。
+    // 域随宿主 storageDomain facility 卸载时统一回收。
+    close: async () => { /* 进程级复用，不在 fiber 级关闭 */ },
   }
 }
 
@@ -339,7 +348,7 @@ function parseFrontmatterName(text: string, fallback: string): { name: string; d
   return { name: fallback, description: '' }
 }
 
-function scanSkillDirs(workspace: string, dshHome: string): Array<{ name: string; description: string; source: string }> {
+function scanSkillDirs(workspace: string, dshHome: string): Array<{ name: string; description: string; source: string; file: string }> {
   const roots: Array<[string, string]> = [
     [join(workspace, '.dsh', 'skills'), 'project-dsh'],
     [join(workspace, '.agents', 'skills'), 'project-agents'],
@@ -347,7 +356,7 @@ function scanSkillDirs(workspace: string, dshHome: string): Array<{ name: string
     // 仅真实用户主目录（.agents 不跟随 DSH_HOME——设计取舍：这是跨实例共享的用户级目录）
     [join(homedir(), '.agents', 'skills'), 'user-agents'],
   ]
-  const out = new Map<string, { name: string; description: string; source: string }>()
+  const out = new Map<string, { name: string; description: string; source: string; file: string }>()
   for (const [dir, source] of roots) {
     let entries: string[] = []
     try { entries = readdirSync(dir) } catch { continue }
@@ -356,14 +365,16 @@ function scanSkillDirs(workspace: string, dshHome: string): Array<{ name: string
         const full = join(dir, entry)
         const stat = statSync(full)
         let text = ''
+        let file = full
         let name = entry.replace(/\.md$/i, '')
         if (stat.isDirectory()) {
-          text = readFileSync(join(full, 'SKILL.md'), 'utf8')
+          file = join(full, 'SKILL.md')
+          text = readFileSync(file, 'utf8')
         } else if (entry.toLowerCase().endsWith('.md')) {
           text = readFileSync(full, 'utf8')
         } else continue
         const parsed = parseFrontmatterName(text, name)
-        if (!out.has(parsed.name)) out.set(parsed.name, { name: parsed.name, description: parsed.description, source })
+        if (!out.has(parsed.name)) out.set(parsed.name, { name: parsed.name, description: parsed.description, source, file })
       } catch { /* 单个坏条目不阻断 */ }
     }
   }
@@ -493,6 +504,8 @@ export async function apply(ctx: AppContext, config: Config): Promise<void> {
     const s = sessionId ? store.sessions[sessionId] : undefined
     const denyT = new Set([...g.deniedTools, ...(s?.deniedTools ?? [])])
     const denyS = new Set([...g.deniedSkills, ...(s?.deniedSkills ?? [])])
+    // 注：放行项的陈旧清理只在 /set 写入侧做（0.6.8）。读取侧无需过滤——
+    //   `denySet − released` 与 `denySet − (released ∩ denySet)` 数学等价（E2E 终验源码+实测双证）。
     for (const n of (s?.releasedTools ?? [])) denyT.delete(n)
     for (const n of (s?.releasedSkills ?? [])) denyS.delete(n)
     for (const n of (g.releasedTools ?? [])) denyT.delete(n)
@@ -959,15 +972,15 @@ export async function apply(ctx: AppContext, config: Config): Promise<void> {
           const nextSkills = hasS ? normalizeSet(body.deniedSkills) : [...current.deniedSkills]
           const nextRelTools = hasRT ? normalizeSet(body.releasedTools) : [...(current.releasedTools ?? [])]
           const nextRelSkills = hasRS ? normalizeSet(body.releasedSkills) : [...(current.releasedSkills ?? [])]
+          const knownSkills = new Set<string>()
+          try { for (const s of (await ctx.skills.snapshot({ cwd: process.cwd() })).skills) knownSkills.add(s.name) } catch { /* fail-open 一部分 */ }
+          try { for (const s of scanSkillDirs(process.cwd(), dshHome)) knownSkills.add(s.name) } catch { /* ignore */ }
           if (hasS && nextSkills.length > 0) {
             // 0.5.3 修复 N1（0.5.2 回归）：白名单必须与 /state 展示清单同源
             // （snapshot + scanSkillDirs 合并）——两清单都为空时 fail-open 不过滤（可用性优先）。
-            const known = new Set<string>()
-            try { for (const s of (await ctx.skills.snapshot({ cwd: process.cwd() })).skills) known.add(s.name) } catch { /* fail-open 一部分 */ }
-            try { for (const s of scanSkillDirs(process.cwd(), dshHome)) known.add(s.name) } catch { /* ignore */ }
-            if (known.size > 0) {
-              for (const n of nextSkills) if (!known.has(n)) trace(`ghost skill name stripped at entry: ${n}`)
-              patchFilter(nextSkills, known)
+            if (knownSkills.size > 0) {
+              for (const n of nextSkills) if (!knownSkills.has(n)) trace(`ghost skill name stripped at entry: ${n}`)
+              patchFilter(nextSkills, knownSkills)
             }
           }
           if (hasT && nextTools.length > 0) {
@@ -981,6 +994,32 @@ export async function apply(ctx: AppContext, config: Config): Promise<void> {
               for (const n of nextTools) if (!knownTools.has(n)) trace(`ghost tool name stripped at entry: ${n}`)
               patchFilter(nextTools, knownTools)
             }
+            // 0.6.4 修复（E2E 四审 C6.5/C6.7）：released* 与 denied* 同一套入口白名单——
+            //   此前 released* 不过滤，幽灵名/保留键名原样落盘（与 denied* 的防御不一致）。
+            if (knownTools.size > 0) {
+              for (const n of nextRelTools) if (!knownTools.has(n)) trace(`ghost tool name stripped from releasedTools: ${n}`)
+              patchFilter(nextRelTools, knownTools)
+            }
+          }
+          if (hasRT && nextRelTools.length > 0 && !(hasT && nextTools.length > 0)) {
+            // 仅传 releasedTools 而未传 deniedTools 时也要过白名单（上面那段在 hasT 分支里）
+            const knownTools = await knownToolNames(sessionId)
+            if (knownTools.size > 0) patchFilter(nextRelTools, knownTools)
+          }
+          if (hasRS && nextRelSkills.length > 0) {
+            if (knownSkills.size > 0) {
+              for (const n of nextRelSkills) if (!knownSkills.has(n)) trace(`ghost skill name stripped from releasedSkills: ${n}`)
+              patchFilter(nextRelSkills, knownSkills)
+            }
+          }
+          // 0.6.8 修复（E2E 六审观察①「服务端陈旧放行记录」）：会话 scope 的放行项若已**不在全局禁用集**
+          //   （全局已解禁）则无意义——留着会在全局**再次**禁用时继续覆盖，形成用户不知情的陈旧放行。
+          //   清理：放行项 ∉ global.denied* 且 ∉ 本会话 denied* → 剔除（与客户端 rebase 的 H3 行为对齐）。
+          if (scope === 'session') {
+            const stillDeniedT = new Set([...store.global.deniedTools, ...nextTools])
+            const stillDeniedS = new Set([...store.global.deniedSkills, ...nextSkills])
+            for (let i = nextRelTools.length - 1; i >= 0; i -= 1) if (!stillDeniedT.has(nextRelTools[i])) nextRelTools.splice(i, 1)
+            for (let i = nextRelSkills.length - 1; i >= 0; i -= 1) if (!stillDeniedS.has(nextRelSkills[i])) nextRelSkills.splice(i, 1)
           }
           const written: DenialSet = {
             deniedTools: nextTools,
@@ -1044,6 +1083,12 @@ export async function apply(ctx: AppContext, config: Config): Promise<void> {
   //       user-agents 500 / bundled 600），模型既看不到该 skill，工具也拒绝加载。
   //   → 比 0.5.x 的 snapshot monkey-patch 更强：旧实现只在目录层过滤，
   //     模型若直接点名仍能用 skill 工具加载被禁 skill。
+  //   ⚠ 0.6.1 修正（E2E 实测推翻初版假设）：**层内 rank 只在同一层内决胜**；跨层是
+  //     「近作用域层按 name 整体覆盖远层」（collectFresh：merged.set(name, entry)），
+  //     所以全局层 shadow 压不住作用域链里的真实 skill——禁用必须产出在**会话作用域层**。
+  //     全局层 provider 仅对「无作用域的读取」（全局视图 / 无活会话）有意义。
+  //   ⚠ candidate.provider 必须等于所属 provider 注册名（validateCandidate），
+  //     否则整个技能目录列举 throw → agent 回合失败。
   // 旧宿主（无 registerProvider）退回 0.5.x 的 snapshot patch 兜底。
   const SKILL_GATE_PROVIDER = 'dsh-skillmcp-gate'
   const SKILL_GATE_PROVIDER_SESSION = 'dsh-skillmcp-gate-session'
@@ -1059,12 +1104,15 @@ export async function apply(ctx: AppContext, config: Config): Promise<void> {
   /** 已挂载会话作用域 provider 的会话键 */
   const sessionSkillProviders = new Set<string>()
 
-  const shadowCandidate = (name: string): Record<string, unknown> => ({
+  const shadowCandidate = (name: string, provider: string): Record<string, unknown> => ({
     name,
     description: DISABLED_SKILL_DESC,
     invocation: { modelInvocable: false, userInvocable: false },
     source: 'custom',
-    provider: SKILL_GATE_PROVIDER,
+    // 0.6.1 修复（E2E 阻断）：candidate.provider 必须等于**所属 provider 的注册名**
+    //   （dsh-skill validateCandidate 要求相等，否则 throw 冒泡到 pre-step → 整个回合失败）。
+    //   会话 provider 注册名是 dsh-skillmcp-gate-session，此前硬编码成全局名导致回合崩溃。
+    provider,
     rank: SKILL_GATE_RANK,
     locator: { name },
   })
@@ -1077,11 +1125,11 @@ export async function apply(ctx: AppContext, config: Config): Promise<void> {
     content: disabledSkillContent(String(candidate.name)),
   })
   /** 依据禁用集合产出 shadow 候选（非法名跳过，保证 provider 永不让整个目录失败） */
-  const shadowCandidatesFor = (names: readonly string[]): Array<Record<string, unknown>> => {
+  const shadowCandidatesFor = (names: readonly string[], provider: string): Array<Record<string, unknown>> => {
     const out: Array<Record<string, unknown>> = []
     for (const name of new Set(names)) {
       if (!SKILL_NAME_RE.test(name)) continue
-      out.push(shadowCandidate(name))
+      out.push(shadowCandidate(name, provider))
     }
     return out
   }
@@ -1090,22 +1138,29 @@ export async function apply(ctx: AppContext, config: Config): Promise<void> {
   const providerCapable = typeof skillsAny?.registerProvider === 'function'
 
   if (providerCapable) {
-    // 全局层 provider：承载 global 默认禁用（全局层参与每条 scope 链 → 全局禁用处处生效）
+    // 全局层 provider：**不产出任何 shadow**（0.6.3 修复 E2E 三审阻断）。
+    // 演进史：0.6.0 全局层产 shadow → 真实 provider 也在全局层、shadow rank=50 同层胜出；
+    //   0.6.1 会话层产 shadow（生效）；但会话放行只是「不产」→ 全局 shadow 仍在 → 放行无效；
+    //   0.6.2 会话层对放行名产「还原候选」→ 目录恢复了，但还原候选得自己造 content，
+    //   磁盘扫描拿不到 bundled skill（代码注册的 provider，如 dsh-office）→ 加载失败。
+    // 正解：全局层**完全不遮挡**——所有禁用由会话层 provider（知道 sid）产出；
+    //   放行 = 会话层对该名不产 shadow → 真实 skill 自然透出（无需造 content）。
+    // 代价：无活会话的「冷读目录」（无 scope）不受禁用影响——那时也没有模型在用，可接受。
+    // 保留本 provider 注册仅为持有 invalidate 句柄（禁用集变更时让目录缓存失效）。
     ctx.effect(() => {
       let control: any = null
       const dispose = skillsAny.registerProvider((c: any) => {
         control = c
         return {
           name: SKILL_GATE_PROVIDER,
-          list: async (): Promise<Array<Record<string, unknown>>> =>
-            shadowCandidatesFor(store.global.deniedSkills),
-          get: async (candidate: any): Promise<Record<string, unknown>> => shadowDefinition(candidate),
+          list: async (): Promise<Array<Record<string, unknown>>> => [],
+          get: async (): Promise<Record<string, unknown> | undefined> => undefined,
         }
       })
       invalidateSkillCatalog = (): void => {
         try { control?.invalidate?.() } catch { /* ignore */ }
       }
-      trace(`skill gate provider registered (official seam, rank=${SKILL_GATE_RANK})`)
+      trace(`skill gate provider registered (official seam; shadows emitted from session layers only)`)
       return (): void => {
         invalidateSkillCatalog = null
         try { dispose() } catch { /* ignore */ }
@@ -1172,9 +1227,11 @@ export async function apply(ctx: AppContext, config: Config): Promise<void> {
           return {
             name: SKILL_GATE_PROVIDER_SESSION,
             list: async (): Promise<Array<Record<string, unknown>>> => {
-              // 会话层 = 该会话「额外禁用」的技能（含全局禁用项；会话 released 已从 effective 中抵消）
-              const eff = effective(sid)
-              return shadowCandidatesFor(eff.deniedSkills)
+              // 会话层 = 该会话**最终生效**的禁用技能（global ∪ session.denied − released）。
+              // 0.6.3：禁用全部在会话层产出（全局层不再遮挡）——会话层是合并链最后一层，
+              //   shadow（rank=50，同层胜出）覆盖任何来源的真实 skill；
+              //   放行 = 本层对该名**不产 shadow** → 真实 skill（含 bundled）自然透出，无需造 content。
+              return shadowCandidatesFor(effective(sid).deniedSkills, SKILL_GATE_PROVIDER_SESSION)
             },
             get: async (candidate: any): Promise<Record<string, unknown>> => shadowDefinition(candidate),
           }

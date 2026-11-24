@@ -1,6 +1,6 @@
 {
   "name": "dsh-skillmcp-gate",
-  "version": "0.6.0",
+  "version": "0.6.8",
   "description": "DSH 按会话管控 skill/MCP 工具暴露集",
   "private": false,
   "type": "module",
